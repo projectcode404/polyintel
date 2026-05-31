@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  python:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    container_name: polyintel_python
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./python:/app
+      - ./python/logs:/app/logs
+    networks:
+      - sikap-network
+
+networks:
+  sikap-network:
+    external: true
+    name: sikap-app_sikap-network

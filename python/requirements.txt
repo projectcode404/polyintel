@@ -1,0 +1,31 @@
+# Python 3.13 — Polymarket Intelligence Collector
+# Sprint 2: Data Collection Layer
+#
+# Pin to minor versions for reproducibility.
+# Update by running: pip-compile requirements.in
+
+# Core ORM + database
+sqlalchemy==2.0.*
+psycopg2-binary==2.9.*
+
+# Settings / validation
+pydantic==2.9.*
+pydantic-settings==2.5.*
+
+# Scheduler
+apscheduler==3.10.*
+
+# HTTP client (sync — collector does not need async)
+httpx==0.27.*
+
+# Date parsing (robust ISO 8601 + timezone handling for Polymarket's timestamps)
+python-dateutil==2.9.*
+
+# Environment files
+python-dotenv==1.0.*
+
+# Redis client (reserved for Sprint 3 cache layer)
+redis==5.0.*
+
+# Structured logging
+structlog==24.4.*
