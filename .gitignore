@@ -1,0 +1,74 @@
+# =============================================================================
+# Polymarket Intelligence Platform — .gitignore
+# =============================================================================
+
+# ---- Environment & Secrets — JANGAN PERNAH COMMIT ----
+.env
+.env.local
+.env.production
+.env.staging
+*.env
+
+# ---- Laravel ----
+laravel/.env
+laravel/.env.*
+laravel/vendor/
+laravel/node_modules/
+laravel/public/hot
+laravel/public/storage
+laravel/storage/*.key
+laravel/storage/app/public/*
+laravel/storage/framework/cache/*
+laravel/storage/framework/sessions/*
+laravel/storage/framework/testing/*
+laravel/storage/framework/views/*
+laravel/storage/logs/*
+laravel/bootstrap/cache/*
+laravel/.phpunit.result.cache
+laravel/Homestead.json
+laravel/Homestead.yaml
+laravel/auth.json
+laravel/npm-debug.log
+laravel/yarn-error.log
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+python/logs/
+python/.env
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Virtual environments ----
+venv/
+.venv/
+env/
+ENV/
+
+# ---- Docker ----
+docker/postgres/data/
+docker/redis/data/
+
+# ---- IDE & OS ----
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+*.log
+
+# ---- Misc ----
+*.bak
+*.tmp
+scripts/secrets/
