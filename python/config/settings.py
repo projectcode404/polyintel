@@ -7,7 +7,7 @@ misconfiguration, so the process fails fast rather than silently misbehaving.
 """
 
 from __future__ import annotations
-
+from urllib.parse import quote_plus
 from pydantic_settings import BaseSettings
 
 
@@ -81,8 +81,10 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
+        """SQLAlchemy-compatible URL. Password is URL-encoded to handle special chars."""
+        password = quote_plus(self.db_password)
         return (
-            f"postgresql+psycopg2://{self.db_username}:{self.db_password}"
+            f"postgresql+psycopg2://{self.db_username}:{password}"
             f"@{self.db_host}:{self.db_port}/{self.db_database}"
         )
 

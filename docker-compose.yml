@@ -1,6 +1,24 @@
-version: "3.9"
+# =============================================================================
+# Polymarket Intelligence Platform — Docker Compose
+#
+# Services:
+#   python  — Data collector (Python 3.13 + APScheduler) port: internal only
+#   laravel — Dashboard (Laravel 12 + FrankenPHP)        port: 8088
+#
+# External services (sudah jalan di Docker network sikap-app_sikap-network):
+#   postgres_db  — PostgreSQL 15
+#   redis_cache  — Redis 7
+#
+# Semua services join network sikap-app_sikap-network agar bisa reach
+# postgres_db dan redis_cache via container name langsung.
+# =============================================================================
 
 services:
+
+  # ---------------------------------------------------------------------------
+  # Python 3.13 — Data Collector
+  # Jalan terus 24/7, collect market data setiap 5 menit
+  # ---------------------------------------------------------------------------
   python:
     build:
       context: ./python
@@ -14,7 +32,63 @@ services:
       - ./python/logs:/app/logs
     networks:
       - sikap-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
+  # ---------------------------------------------------------------------------
+  # Laravel 12 + FrankenPHP — Dashboard
+  # Port 8088 → akses via http://ip-vps:8088
+  # Volume mount: setiap perubahan di ./laravel langsung live tanpa rebuild
+  # ---------------------------------------------------------------------------
+  laravel:
+    build:
+      context: ./laravel
+      dockerfile: Dockerfile
+    container_name: polyintel_laravel
+    restart: unless-stopped
+    env_file:
+      - .env
+      - laravel/.env
+    environment:
+      # FrankenPHP server config
+      SERVER_NAME: ":80"
+      # Laravel app config — override dari .env kalau perlu
+      APP_ENV:   ${APP_ENV:-production}
+      APP_DEBUG: ${APP_DEBUG:-false}
+    ports:
+      - "8088:80"
+    volumes:
+      # Mount seluruh Laravel project — live reload tanpa rebuild
+      - ./laravel:/app
+      # Persistent storage untuk logs, cache, uploads
+      - laravel_storage:/app/storage
+    networks:
+      - sikap-network
+    depends_on:
+      python:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/up"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  laravel_storage:
+    driver: local
+
+# =============================================================================
+# Networks — join existing network dari sikap-app
+# postgres_db dan redis_cache sudah ada di network ini
+# =============================================================================
 networks:
   sikap-network:
     external: true
