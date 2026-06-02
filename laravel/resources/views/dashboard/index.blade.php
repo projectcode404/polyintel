@@ -131,7 +131,7 @@
                 </div>
             </div>
             <div class="card-body">
-                <div id="snapshotActivityChart" style="height: 200px;"></div>
+                <canvas id="snapshotActivityChart" style="height: 200px;"></canvas>
             </div>
         </div>
     </div>
@@ -143,7 +143,7 @@
                 <h3 class="card-title">Markets by Category</h3>
             </div>
             <div class="card-body">
-                <div id="subCategoryChart" style="height: 200px;"></div>
+                <canvas id="subCategoryChart" style="height: 200px;"></canvas>
             </div>
         </div>
     </div>
@@ -165,7 +165,7 @@
                 </div>
             </div>
             <div class="card-body">
-                <div id="probabilityDistChart" style="height: 200px;"></div>
+                <canvas id="probabilityDistChart" style="height: 200px;"></canvas>
             </div>
         </div>
     </div>
