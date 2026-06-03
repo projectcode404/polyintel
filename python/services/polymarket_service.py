@@ -263,60 +263,32 @@ class PolymarketService:
                 )
                 return
 
-            if len(response_data) < settings.gamma_page_size:
-                log.info(
-                    "keyset_pagination_complete",
-                    total_pages=page_num,
-                    total_crypto=total_crypto,
-                    reason="last_page",
-                )
-                return
-
             cursor = next_cursor
 
     @retry(exceptions=(httpx.HTTPError, PolymarketRateLimitError))
     def _fetch_keyset_page(
         self, params: dict[str, Any]
     ) -> tuple[list[dict], str | None]:
-        """
-        Fetch satu page dari /markets/keyset.
-        Return (markets_list, next_cursor).
-
-        Raise PolymarketAPIError kalau endpoint tidak ada (404/422 tanpa keyset hint).
-        """
         url = f"{settings.polymarket_gamma_url}/markets/keyset"
-
         try:
             response = self._client.get(url, params=params)
-
-            # 404 = keyset endpoint tidak ada di API version ini
             if response.status_code == 404:
-                raise PolymarketAPIError(
-                    "Keyset endpoint not found",
-                    status_code=404,
-                    url=url,
-                )
-
+                raise PolymarketAPIError("Keyset endpoint not found", status_code=404, url=url)
             self._raise_for_status(response, url)
             data = response.json()
 
-            # Parse response — bisa list atau {"data": [], "next_cursor": "..."}
             if isinstance(data, list):
                 markets_list = data
-                # Coba ambil next cursor dari response header
                 next_cursor = response.headers.get("X-Next-Cursor")
+                # FIX: Fallback kursor jika header tidak ada
+                if not next_cursor and len(markets_list) > 0:
+                    last_item = markets_list[-1]
+                    next_cursor = str(last_item.get("cursor") or last_item.get("id") or last_item.get("conditionId") or "")
+                    if not next_cursor:
+                        next_cursor = None
             elif isinstance(data, dict):
-                markets_list = (
-                    data.get("data")
-                    or data.get("markets")
-                    or data.get("results")
-                    or []
-                )
-                next_cursor = (
-                    data.get("next_cursor")
-                    or data.get("nextCursor")
-                    or data.get("cursor")
-                )
+                markets_list = data.get("data") or data.get("markets") or data.get("results") or []
+                next_cursor = data.get("next_cursor") or data.get("nextCursor") or data.get("cursor")
             else:
                 markets_list = []
                 next_cursor = None
@@ -415,59 +387,39 @@ class PolymarketService:
 
     @retry(exceptions=(httpx.HTTPError, PolymarketRateLimitError))
     def get_orderbook(self, condition_id: str) -> RawOrderbook | None:
-        """
-        Fetch live probability, volume, liquidity untuk satu market dari CLOB API.
-        Return None kalau market tidak ditemukan.
-
-        Strategy:
-          1. GET /markets/{condition_id} — dapatkan price dan tokens
-          2. GET /book?token_id={first_yes_token} — dapatkan orderbook (bid/ask)
-        """
         url_market = f"{settings.polymarket_clob_url}/markets/{condition_id}"
-
         try:
-            # Fetch market data with price
             response = self._client.get(url_market)
-
             if response.status_code == 404:
-                log.warning("clob_market_not_found", condition_id=condition_id)
                 return None
-
             self._raise_for_status(response, url_market)
             market_data = response.json()
-
             if not market_data:
                 return None
 
-            # Fetch orderbook for first token (YES token) if available
             tokens = market_data.get("tokens", [])
             first_token_id = None
             if tokens and isinstance(tokens, list):
                 first_token = tokens[0]
                 if isinstance(first_token, dict):
-                    first_token_id = first_token.get("token_id") or first_token.get("id")
+                    # FIX: Cek key "token"
+                    first_token_id = first_token.get("token") or first_token.get("token_id") or first_token.get("id")
 
-            # Try to get orderbook for bid/ask
             orderbook_data = None
             if first_token_id:
-                try:
-                    url_book = f"{settings.polymarket_clob_url}/book"
-                    response_book = self._client.get(url_book, params={"token_id": first_token_id})
-                    if response_book.status_code == 200:
-                        orderbook_data = response_book.json()
-                except Exception as exc:
-                    log.debug("orderbook_fetch_failed", token_id=first_token_id, error=str(exc))
+                url_book = f"{settings.polymarket_clob_url}/book"
+                response_book = self._client.get(url_book, params={"token_id": first_token_id})
+                # FIX: Lempar error jika 429 agar retry berjalan
+                self._raise_for_status(response_book, url_book)
+                if response_book.status_code == 200:
+                    orderbook_data = response_book.json()
 
             return self._parse_clob_market(condition_id, market_data, orderbook_data)
 
         except httpx.TimeoutException as exc:
-            raise PolymarketAPIError(
-                f"CLOB API timeout untuk {condition_id}", url=url_market
-            ) from exc
+            raise PolymarketAPIError(f"CLOB API timeout", url=url_market) from exc
         except httpx.NetworkError as exc:
-            raise PolymarketAPIError(
-                f"CLOB API network error: {exc}", url=url_market
-            ) from exc
+            raise PolymarketAPIError(f"CLOB API network error", url=url_market) from exc
 
     def get_orderbooks_batch(
         self, condition_ids: list[str]

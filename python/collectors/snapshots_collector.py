@@ -269,17 +269,28 @@ class SnapshotsCollector:
         return result
 
     def _fetch_orderbooks(self, condition_ids: list[str]) -> dict[str, RawOrderbook | None]:
-        """
-        Fetch CLOB orderbooks for a list of condition_ids.
-        Individual failures are caught and stored as None —
-        the caller skips markets with None orderbooks.
-        """
-        try:
-            return self._polymarket.get_orderbooks_batch(condition_ids)
-        except PolymarketAPIError as exc:
-            log.error("orderbook_batch_fetch_failed", error=str(exc))
-            # Return all None — entire batch will be skipped
-            return {cid: None for cid in condition_ids}
+        import concurrent.futures
+        
+        results: dict[str, RawOrderbook | None] = {}
+
+        def fetch_single(cid: str) -> tuple[str, RawOrderbook | None]:
+            try:
+                # Menggunakan method get_orderbook (single) dari polymarket_service
+                return cid, self._polymarket.get_orderbook(cid)
+            except Exception as exc:
+                log.error("orderbook_fetch_failed", condition_id=cid, error=str(exc))
+                return cid, None
+
+        # Gunakan 15 thread pekerja agar bisa menarik banyak market sekaligus
+        max_threads = 15
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
+            future_to_cid = {executor.submit(fetch_single, cid): cid for cid in condition_ids}
+            for future in concurrent.futures.as_completed(future_to_cid):
+                cid, orderbook = future.result()
+                results[cid] = orderbook
+
+        return results
+
 
     def _write_snapshot(
         self,

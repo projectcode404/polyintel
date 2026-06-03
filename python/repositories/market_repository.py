@@ -168,9 +168,10 @@ class MarketRepository:
                     Market.deleted_at.is_(None),
                 )
                 .order_by(Market.volume_usd.desc())
-                .limit(500)   # Hard safety cap — never snapshot > 500 markets
+                # Limit 500 telah dihapus agar AI bisa mencari edge di semua market
             ).scalars().all()
         )
+
 
     def update_probability_cache(
         self,
