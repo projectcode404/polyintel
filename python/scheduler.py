@@ -250,7 +250,7 @@ def main() -> None:
         # Two threads: one for markets job, one for snapshots job.
         # They never run concurrently (different schedules) but the pool
         # allows both to be scheduled without blocking each other.
-        "default": ThreadPoolExecutor(max_workers=2),
+        "default": ThreadPoolExecutor(max_workers=4),
     }
 
     job_defaults = {
