@@ -1,4 +1,4 @@
-import logging
+from utils.logger import get_logger
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import select
 from typing import List, Dict, Any
@@ -6,7 +6,7 @@ from typing import List, Dict, Any
 from utils.db import get_session
 from models.signal import Signal
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 class SignalRepository:
     """

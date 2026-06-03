@@ -1,9 +1,9 @@
-import logging
+from utils.logger import get_logger
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 class EdgeCalculator:
     """

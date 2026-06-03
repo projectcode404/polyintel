@@ -1,4 +1,4 @@
-import logging
+from utils.logger import get_logger
 import time
 from datetime import datetime, timezone
 from sqlalchemy import select
@@ -9,7 +9,7 @@ from models.stats import MarketDailyStat
 from services.edge_calculator import EdgeCalculator
 from repositories.signal_repository import SignalRepository
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 class SignalCollector:
     """
