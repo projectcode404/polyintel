@@ -319,31 +319,6 @@ class PolymarketService:
                 markets_list = []
                 next_cursor = None
 
-            # DEBUG: Log first 2 market raw responses
-            if not hasattr(self, '_keyset_fetch_count'):
-                self._keyset_fetch_count = 0
-            self._keyset_fetch_count += 1
-            
-            if self._keyset_fetch_count == 1 and markets_list:
-                # Log first market detail
-                first_market = markets_list[0]
-                log.info(
-                    "DEBUG_GAMMA_API_RAW_FIRST_MARKET",
-                    market_keys=list(first_market.keys()) if isinstance(first_market, dict) else None,
-                    market_data_sample=str(first_market)[:500] if isinstance(first_market, dict) else str(first_market)[:500],
-                )
-                
-                # Log probability field specifically
-                if isinstance(first_market, dict):
-                    log.info(
-                        "DEBUG_GAMMA_API_OUTCOME_PRICES",
-                        first_market_outcome_prices=first_market.get("outcomePrices"),
-                        first_market_volume=first_market.get("volume"),
-                        first_market_volume_num=first_market.get("volumeNum"),
-                        first_market_liquidity=first_market.get("liquidity"),
-                        first_market_liquidity_num=first_market.get("liquidityNum"),
-                    )
-
             return markets_list, next_cursor
 
         except httpx.TimeoutException as exc:
@@ -442,13 +417,12 @@ class PolymarketService:
         Fetch live probability untuk satu market dari CLOB API.
         Return None kalau market tidak ditemukan.
 
-        CLOB endpoint: GET /markets?condition_id={condition_id}
+        CLOB endpoint: GET /markets/{condition_id} (path parameter, not query param)
         """
-        url = f"{settings.polymarket_clob_url}/markets"
-        params = {"condition_id": condition_id}
+        url = f"{settings.polymarket_clob_url}/markets/{condition_id}"
 
         try:
-            response = self._client.get(url, params=params)
+            response = self._client.get(url)
 
             if response.status_code == 404:
                 log.warning("clob_market_not_found", condition_id=condition_id)
@@ -471,20 +445,6 @@ class PolymarketService:
             if not market_data:
                 return None
 
-            # DEBUG: Log first CLOB response
-            if not hasattr(self, '_clob_fetch_count'):
-                self._clob_fetch_count = 0
-            self._clob_fetch_count += 1
-            
-            if self._clob_fetch_count <= 2:
-                log.info(
-                    "DEBUG_CLOB_API_RAW_RESPONSE",
-                    fetch_num=self._clob_fetch_count,
-                    condition_id=condition_id,
-                    market_data_keys=list(market_data.keys()) if isinstance(market_data, dict) else None,
-                    market_data_sample=str(market_data)[:800] if isinstance(market_data, dict) else str(market_data)[:800],
-                )
-
             return self._parse_clob_market(condition_id, market_data)
 
         except httpx.TimeoutException as exc:
@@ -504,24 +464,9 @@ class PolymarketService:
         Individual failures di-log dan di-skip — tidak abort batch.
         """
         results: dict[str, RawOrderbook | None] = {}
-        for idx, condition_id in enumerate(condition_ids):
+        for condition_id in condition_ids:
             try:
-                orderbook = self.get_orderbook(condition_id)
-                results[condition_id] = orderbook
-                
-                # LOG DETAIL UNTUK 5 MARKET PERTAMA
-                if idx < 5:
-                    log.info(
-                        "DEBUG_CLOB_PARSE",
-                        market_num=idx + 1,
-                        condition_id=condition_id,
-                        parsed_probability_yes=str(orderbook.probability_yes) if orderbook else None,
-                        parsed_probability_no=str(orderbook.probability_no) if orderbook else None,
-                        parsed_volume=str(orderbook.volume_usd) if orderbook else None,
-                        parsed_liquidity=str(orderbook.liquidity_usd) if orderbook else None,
-                        best_bid=str(orderbook.best_bid) if orderbook and orderbook.best_bid else None,
-                        best_ask=str(orderbook.best_ask) if orderbook and orderbook.best_ask else None,
-                    )
+                results[condition_id] = self.get_orderbook(condition_id)
             except PolymarketAPIError as exc:
                 log.error(
                     "orderbook_fetch_failed",
@@ -538,29 +483,9 @@ class PolymarketService:
     def _parse_page(self, raw_markets: list[dict]) -> list[RawMarket]:
         """Parse satu page of raw dicts menjadi list[RawMarket]. Skip yang error."""
         parsed = []
-        for idx, m in enumerate(raw_markets):
+        for m in raw_markets:
             try:
-                result = self._parse_gamma_market(m)
-                parsed.append(result)
-                
-                # LOG DETAIL UNTUK 5 MARKET PERTAMA
-                if idx < 5:
-                    log.info(
-                        "DEBUG_GAMMA_PARSE",
-                        market_num=idx + 1,
-                        condition_id=result.condition_id,
-                        raw_outcome_prices=m.get("outcomePrices"),
-                        raw_volume=m.get("volume"),
-                        raw_volume_num=m.get("volumeNum"),
-                        raw_liquidity=m.get("liquidity"),
-                        raw_liquidity_num=m.get("liquidityNum"),
-                        raw_trades_count=m.get("tradesCount"),
-                        raw_unique_traders=m.get("uniqueTraders"),
-                        parsed_probability=str(result.market_probability),
-                        parsed_volume=str(result.volume_usd),
-                        parsed_liquidity=str(result.liquidity_usd),
-                        parsed_traders=result.num_traders,
-                    )
+                parsed.append(self._parse_gamma_market(m))
             except Exception as exc:
                 log.warning(
                     "market_parse_error",
@@ -627,27 +552,6 @@ class PolymarketService:
           2. tokens[0].price  — fallback
           3. 0.5              — last resort
         """
-        # LOG RAW DATA UNTUK FIRST 5 (AKAN DIFILTER DI SINI)
-        # Kita track counter untuk tahu berapa kali function ini dipanggil
-        if not hasattr(self, '_clob_parse_count'):
-            self._clob_parse_count = 0
-        self._clob_parse_count += 1
-        
-        if self._clob_parse_count <= 5:
-            log.info(
-                "DEBUG_CLOB_RAW_RESPONSE",
-                market_num=self._clob_parse_count,
-                condition_id=condition_id,
-                raw_outcome_prices=data.get("outcomePrices"),
-                raw_tokens=data.get("tokens"),
-                raw_volume=data.get("volume"),
-                raw_volume_num=data.get("volumeNum"),
-                raw_volume_24h=data.get("volume24hr"),
-                raw_liquidity=data.get("liquidity"),
-                raw_liquidity_num=data.get("liquidityNum"),
-                raw_orderbook_keys=list(data.get("orderbook", {}).keys()) if isinstance(data.get("orderbook"), dict) else None,
-            )
-        
         # Probability dari outcomePrices
         probability_yes = self._extract_probability_yes(data)
 
@@ -834,47 +738,17 @@ class PolymarketService:
           [0.63, 0.37]        — list of floats
         """
         outcome_prices = data.get("outcomePrices")
-        
-        # DEBUG LOGGING
-        if not hasattr(self, '_extract_prob_count'):
-            self._extract_prob_count = 0
-        self._extract_prob_count += 1
-        
-        if self._extract_prob_count <= 5:
-            log.info(
-                "DEBUG_EXTRACT_PROBABILITY",
-                call_num=self._extract_prob_count,
-                raw_outcome_prices=outcome_prices,
-                outcome_prices_type=type(outcome_prices).__name__,
-            )
-        
         if outcome_prices is None:
             return None
         if isinstance(outcome_prices, str):
             try:
                 outcome_prices = json.loads(outcome_prices)
-                if self._extract_prob_count <= 5:
-                    log.info(
-                        "DEBUG_EXTRACT_PROBABILITY_AFTER_JSON_PARSE",
-                        call_num=self._extract_prob_count,
-                        parsed_outcome_prices=outcome_prices,
-                        parsed_type=type(outcome_prices).__name__,
-                    )
             except (ValueError, json.JSONDecodeError):
                 return None
         if isinstance(outcome_prices, list) and outcome_prices:
             try:
                 p = Decimal(str(outcome_prices[0]))
-                clamped = max(Decimal("0"), min(Decimal("1"), p))
-                if self._extract_prob_count <= 5:
-                    log.info(
-                        "DEBUG_EXTRACT_PROBABILITY_FINAL",
-                        call_num=self._extract_prob_count,
-                        first_element=outcome_prices[0],
-                        as_decimal=str(p),
-                        clamped_value=str(clamped),
-                    )
-                return clamped
+                return max(Decimal("0"), min(Decimal("1"), p))
             except (InvalidOperation, Exception):
                 return None
         return None
