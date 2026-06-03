@@ -279,13 +279,22 @@ class PolymarketService:
 
             if isinstance(data, list):
                 markets_list = data
-                next_cursor = response.headers.get("X-Next-Cursor")
-                # FIX: Fallback kursor jika header tidak ada
+                
+                # PERBAIKAN UTAMA: Cari header secara case-insensitive
+                next_cursor = None
+                for header_key, header_val in response.headers.items():
+                    if header_key.lower() == "x-next-cursor":
+                        next_cursor = header_val
+                        break
+                        
+                # Fallback kursor jika header benar-benar tidak ada di response API
                 if not next_cursor and len(markets_list) > 0:
                     last_item = markets_list[-1]
-                    next_cursor = str(last_item.get("cursor") or last_item.get("id") or last_item.get("conditionId") or "")
+                    # Polymarket Keyset biasanya menaruh cursor string di key 'cursor'
+                    next_cursor = last_item.get("cursor")
                     if not next_cursor:
                         next_cursor = None
+                        
             elif isinstance(data, dict):
                 markets_list = data.get("data") or data.get("markets") or data.get("results") or []
                 next_cursor = data.get("next_cursor") or data.get("nextCursor") or data.get("cursor")
