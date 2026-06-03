@@ -98,18 +98,24 @@ class EdgeCalculator:
                     "edge": 0.05, # Fixed edge for volume spike as it's harder to quantify
                     "context": context
                 })
-                
+
         # Rule 4: Time Decay (Near Expiry)
         if market.end_date:
-            hours_to_expiry = (market.end_date - now).total_seconds() / 3600
-            if 0 < hours_to_expiry < 48:
-                if Decimal("0.40") <= prob_yes <= Decimal("0.60"):
-                    # Market is undecided but close to expiry
-                    signals.append({
-                        "direction": "yes", # Arbitrary for decay, could be both but we just pick yes for now or rely on other factors
-                        "trigger_source": "rule_4_time_decay",
-                        "edge": 0.05,
-                        "context": context
-                    })
-                    
+            # Pastikan market.end_date memiliki zona waktu UTC jika belum ada
+            end_date = market.end_date
+
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+        
+        hours_to_expiry = (end_date - now).total_seconds() / 3600
+    
+        if 0 < hours_to_expiry < 48:
+            if Decimal("0.40") <= prob_yes <= Decimal("0.60"):
+                signals.append({
+                "direction": "yes",
+                "trigger_source": "rule_4_time_decay",
+                "edge": 0.05,
+                "context": context
+            })            
+
         return signals
