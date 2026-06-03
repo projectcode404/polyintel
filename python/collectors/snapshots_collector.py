@@ -307,7 +307,7 @@ class SnapshotsCollector:
             best_ask=orderbook.best_ask,
             spread=orderbook.spread,
             volume_usd=market.volume_usd,
-            volume_24h_usd=market.volume_24h_usd,
+            volume_24h_usd=market.volume_usd,
             liquidity_usd=market.liquidity_usd,
             snapshotted_at=snapshotted_at,
             btc_price_usd=context.btc_price_usd,
