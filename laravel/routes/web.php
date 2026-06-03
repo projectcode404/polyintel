@@ -3,6 +3,8 @@
 use App\Http\Controllers\Admin\UserController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\MarketController;
+use App\Http\Controllers\SignalController;
+use App\Http\Controllers\PaperTradeController;
 use Illuminate\Support\Facades\Route;
 
 // ---- Auth ----
@@ -28,18 +30,19 @@ Route::middleware(['auth'])->group(function () {
             ->name('show');
     });
 
-    // ---- Placeholder pages ----
-    Route::get('/signals', fn () => view('placeholder.coming-soon', [
-        'title'   => 'Signals',
-        'message' => 'Signal generation akan tersedia di Sprint 4.',
-        'icon'    => 'activity',
-    ]))->name('signals.index');
+    // ---- Signals ----
+    Route::prefix('signals')->name('signals.')->group(function () {
+        Route::get('/', [SignalController::class, 'index'])->name('index');
+        Route::post('/{signal}/execute', [SignalController::class, 'execute'])->name('execute');
+        Route::post('/{signal}/ignore', [SignalController::class, 'ignore'])->name('ignore');
+    });
 
-    Route::get('/paper-trades', fn () => view('placeholder.coming-soon', [
-        'title'   => 'Paper Trades',
-        'message' => 'Paper trading akan tersedia setelah signals aktif.',
-        'icon'    => 'trending-up',
-    ]))->name('paper-trades.index');
+    // ---- Paper Trades ----
+    Route::prefix('paper-trades')->name('paper-trades.')->group(function () {
+        Route::get('/', [PaperTradeController::class, 'index'])->name('index');
+        Route::post('/{trade}/close', [PaperTradeController::class, 'close'])->name('close');
+        Route::post('/settings', [PaperTradeController::class, 'updateSettings'])->name('settings');
+    });
 
     Route::get('/performance', fn () => view('placeholder.coming-soon', [
         'title'   => 'Performance',

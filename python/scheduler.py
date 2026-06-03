@@ -59,6 +59,8 @@ log = get_logger(__name__)
 
 _markets_collector = None
 _snapshots_collector = None
+_stats_collector = None
+_signals_collector = None
 
 
 def _init_collectors() -> None:
@@ -70,9 +72,13 @@ def _init_collectors() -> None:
 
     from collectors.markets_collector import MarketsCollector
     from collectors.snapshots_collector import SnapshotsCollector
+    from collectors.stats_collector import StatsCollector
+    from collectors.signal_collector import SignalCollector
 
     _markets_collector = MarketsCollector()
     _snapshots_collector = SnapshotsCollector()
+    _stats_collector = StatsCollector()
+    _signals_collector = SignalCollector()
     log.info("collectors_initialised")
 
 
@@ -114,6 +120,34 @@ def job_collect_snapshots() -> None:
         )
     except Exception as exc:
         log.exception("job_collect_snapshots_failed", error=str(exc))
+        raise
+
+
+def job_collect_stats() -> None:
+    """
+    APScheduler job: compute daily stats (7d volume, 24h momentum).
+    Runs every hour to keep stats reasonably fresh without heavy load.
+    """
+    log.info("job_collect_stats_start")
+    try:
+        _stats_collector.run()
+        log.info("job_collect_stats_done")
+    except Exception as exc:
+        log.exception("job_collect_stats_failed", error=str(exc))
+        raise
+
+
+def job_collect_signals() -> None:
+    """
+    APScheduler job: evaluate rules and generate signals.
+    Runs every SNAPSHOT_INTERVAL_MINUTES.
+    """
+    log.info("job_collect_signals_start")
+    try:
+        _signals_collector.run()
+        log.info("job_collect_signals_done")
+    except Exception as exc:
+        log.exception("job_collect_signals_failed", error=str(exc))
         raise
 
 
@@ -256,6 +290,25 @@ def main() -> None:
         name="Snapshot Collection (CLOB API)",
         next_run_time=now,   # Run immediately on startup
     )
+
+    _scheduler.add_job(
+        job_collect_stats,
+        trigger="interval",
+        minutes=60, # Every hour
+        id="collect_stats",
+        name="Daily Stats Precomputation",
+        next_run_time=now,   # Run immediately on startup
+    )
+
+    _scheduler.add_job(
+        job_collect_signals,
+        trigger="interval",
+        minutes=settings.snapshot_interval_minutes, # Same as snapshots
+        id="collect_signals",
+        name="Signal Generation (Rules)",
+        next_run_time=now,   # Run immediately on startup
+    )
+
 
     # 6. Start
     _scheduler.start()
