@@ -414,46 +414,57 @@ class PolymarketService:
     @retry(exceptions=(httpx.HTTPError, PolymarketRateLimitError))
     def get_orderbook(self, condition_id: str) -> RawOrderbook | None:
         """
-        Fetch live probability untuk satu market dari CLOB API.
+        Fetch live probability, volume, liquidity untuk satu market dari CLOB API.
         Return None kalau market tidak ditemukan.
 
-        CLOB endpoint: GET /markets/{condition_id} (path parameter, not query param)
+        Strategy:
+          1. GET /markets/{condition_id} — dapatkan price dan tokens
+          2. GET /book?token_id={first_yes_token} — dapatkan orderbook (bid/ask)
         """
-        url = f"{settings.polymarket_clob_url}/markets/{condition_id}"
+        url_market = f"{settings.polymarket_clob_url}/markets/{condition_id}"
 
         try:
-            response = self._client.get(url)
+            # Fetch market data with price
+            response = self._client.get(url_market)
 
             if response.status_code == 404:
                 log.warning("clob_market_not_found", condition_id=condition_id)
                 return None
 
-            self._raise_for_status(response, url)
-            data = response.json()
-
-            # Normalise response shape
-            if isinstance(data, dict) and "data" in data:
-                items = data["data"]
-                market_data = items[0] if items else None
-            elif isinstance(data, list):
-                market_data = data[0] if data else None
-            elif isinstance(data, dict):
-                market_data = data
-            else:
-                return None
+            self._raise_for_status(response, url_market)
+            market_data = response.json()
 
             if not market_data:
                 return None
 
-            return self._parse_clob_market(condition_id, market_data)
+            # Fetch orderbook for first token (YES token) if available
+            tokens = market_data.get("tokens", [])
+            first_token_id = None
+            if tokens and isinstance(tokens, list):
+                first_token = tokens[0]
+                if isinstance(first_token, dict):
+                    first_token_id = first_token.get("token_id") or first_token.get("id")
+
+            # Try to get orderbook for bid/ask
+            orderbook_data = None
+            if first_token_id:
+                try:
+                    url_book = f"{settings.polymarket_clob_url}/book"
+                    response_book = self._client.get(url_book, params={"token_id": first_token_id})
+                    if response_book.status_code == 200:
+                        orderbook_data = response_book.json()
+                except Exception as exc:
+                    log.debug("orderbook_fetch_failed", token_id=first_token_id, error=str(exc))
+
+            return self._parse_clob_market(condition_id, market_data, orderbook_data)
 
         except httpx.TimeoutException as exc:
             raise PolymarketAPIError(
-                f"CLOB API timeout untuk {condition_id}", url=url
+                f"CLOB API timeout untuk {condition_id}", url=url_market
             ) from exc
         except httpx.NetworkError as exc:
             raise PolymarketAPIError(
-                f"CLOB API network error: {exc}", url=url
+                f"CLOB API network error: {exc}", url=url_market
             ) from exc
 
     def get_orderbooks_batch(
@@ -543,27 +554,36 @@ class PolymarketService:
             raw=data,
         )
 
-    def _parse_clob_market(self, condition_id: str, data: dict[str, Any]) -> RawOrderbook:
+    def _parse_clob_market(
+        self, condition_id: str, market_data: dict[str, Any], orderbook_data: dict[str, Any] | None = None
+    ) -> RawOrderbook:
         """
         Normalise CLOB API response ke RawOrderbook.
 
-        Priority untuk probability_yes:
-          1. outcomePrices[0] — paling reliable
-          2. tokens[0].price  — fallback
-          3. 0.5              — last resort
+        Sources:
+          market_data (dari /markets/{condition_id}):
+            - price dari tokens[0].price
+            - volume dari market_data.volume
+            - liquidity dari market_data.liquidity
+          
+          orderbook_data (dari /book?token_id=):
+            - best_bid dari bids[0]
+            - best_ask dari asks[0]
         """
-        # Probability dari outcomePrices
-        probability_yes = self._extract_probability_yes(data)
+        # Probability dari tokens[0].price
+        probability_yes: Decimal | None = None
+        tokens = market_data.get("tokens", [])
+        
+        if tokens and isinstance(tokens, list):
+            first_token = tokens[0]
+            if isinstance(first_token, dict):
+                token_price = first_token.get("price")
+                if token_price is not None:
+                    probability_yes = self._safe_decimal_or_none(token_price)
 
-        # Fallback ke tokens[0].price
+        # Fallback ke outcomePrices kalau tokens[0].price tidak ada
         if probability_yes is None:
-            tokens = data.get("tokens", [])
-            if tokens and isinstance(tokens, list):
-                yes_token = tokens[0]
-                if isinstance(yes_token, dict):
-                    probability_yes = self._safe_decimal_or_none(
-                        yes_token.get("price")
-                    )
+            probability_yes = self._extract_probability_yes(market_data)
 
         if probability_yes is None:
             probability_yes = Decimal("0.5")
@@ -572,24 +592,43 @@ class PolymarketService:
         probability_yes = max(Decimal("0"), min(Decimal("1"), probability_yes))
         probability_no = Decimal("1") - probability_yes
 
-        # Bid/ask dari orderbook
+        # Volume dan liquidity dari market_data
+        volume_usd = self._safe_decimal(
+            market_data.get("volume") or market_data.get("volumeNum") or 0
+        )
+        volume_24h_usd = self._safe_decimal(
+            market_data.get("volume24hr")
+            or market_data.get("volume24h")
+            or market_data.get("volume_24h")
+            or 0
+        )
+        liquidity_usd = self._safe_decimal(
+            market_data.get("liquidity") or market_data.get("liquidityNum") or 0
+        )
+
+        # Bid/ask dari orderbook_data jika tersedia
         best_bid: Decimal | None = None
         best_ask: Decimal | None = None
 
-        orderbook = data.get("orderbook", {})
-        if isinstance(orderbook, dict) and orderbook:
-            bids = orderbook.get("bids", [])
-            asks = orderbook.get("asks", [])
-            if bids:
+        if orderbook_data and isinstance(orderbook_data, dict):
+            bids = orderbook_data.get("bids", [])
+            asks = orderbook_data.get("asks", [])
+            
+            if bids and isinstance(bids, list):
                 first_bid = bids[0]
-                best_bid = self._safe_decimal_or_none(
-                    first_bid.get("price") if isinstance(first_bid, dict) else first_bid
-                )
-            if asks:
+                # Bids might be array of [price, size] or object with price field
+                if isinstance(first_bid, (list, tuple)):
+                    best_bid = self._safe_decimal_or_none(first_bid[0])
+                elif isinstance(first_bid, dict):
+                    best_bid = self._safe_decimal_or_none(first_bid.get("price"))
+            
+            if asks and isinstance(asks, list):
                 first_ask = asks[0]
-                best_ask = self._safe_decimal_or_none(
-                    first_ask.get("price") if isinstance(first_ask, dict) else first_ask
-                )
+                # Asks might be array of [price, size] or object with price field
+                if isinstance(first_ask, (list, tuple)):
+                    best_ask = self._safe_decimal_or_none(first_ask[0])
+                elif isinstance(first_ask, dict):
+                    best_ask = self._safe_decimal_or_none(first_ask.get("price"))
 
         spread = (
             (best_ask - best_bid)
@@ -604,18 +643,9 @@ class PolymarketService:
             best_bid=best_bid,
             best_ask=best_ask,
             spread=spread,
-            volume_usd=self._safe_decimal(
-                data.get("volume") or data.get("volumeNum") or 0
-            ),
-            volume_24h_usd=self._safe_decimal(
-                data.get("volume24hr")
-                or data.get("volume24h")
-                or data.get("volume_24h")
-                or 0
-            ),
-            liquidity_usd=self._safe_decimal(
-                data.get("liquidity") or data.get("liquidityNum") or 0
-            ),
+            volume_usd=volume_usd,
+            volume_24h_usd=volume_24h_usd,
+            liquidity_usd=liquidity_usd,
         )
 
     # =========================================================================
