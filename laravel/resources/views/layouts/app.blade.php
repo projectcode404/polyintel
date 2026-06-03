@@ -39,7 +39,6 @@
             background-color: rgba(var(--tblr-primary-rgb), 0.08) !important;
         }
     </style>
-
     @stack('styles')
 </head>
 <body class="antialiased">
@@ -177,9 +176,9 @@
                                 </span>
                             </div>
                         </div>
-                        <form method="POST" action="{{ route('logout') }}">
+                        <form method="POST" action="{{ route('logout') }}" class="flex-shrink-0">
                             @csrf
-                            <button type="submit" class="btn btn-sm btn-ghost-light" title="Logout">
+                            <button type="submit" class="btn btn-sm btn-outline-light" title="Logout">
                                 <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-sm" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none">
                                     <path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M14 8v-2a2 2 0 0 0 -2 -2h-7a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h7a2 2 0 0 0 2 -2v-2"/><path d="M9 12h12l-3 -3"/><path d="M18 15l3 -3"/>
                                 </svg>
