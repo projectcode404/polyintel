@@ -68,7 +68,7 @@ def _init_collectors() -> None:
     Initialise collector singletons at startup.
     Reusing instances preserves TCP connections across runs (httpx Client).
     """
-    global _markets_collector, _snapshots_collector
+    global _markets_collector, _snapshots_collector, _stats_collector, _signals_collector
 
     from collectors.markets_collector import MarketsCollector
     from collectors.snapshots_collector import SnapshotsCollector
