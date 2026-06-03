@@ -82,16 +82,18 @@ class RawMarket:
 
 @dataclass
 class RawOrderbook:
-    """Live price snapshot dari CLOB API."""
+    """Live price snapshot dari CLOB API.
+    
+    NOTE: volume_usd, liquidity_usd come from Gamma API, not CLOB API.
+    CLOB API only provides live prices (probability, bid/ask).
+    Use market table (from DB) for volume/liquidity data.
+    """
     condition_id: str
     probability_yes: Decimal
     probability_no: Decimal
     best_bid: Decimal | None
     best_ask: Decimal | None
     spread: Decimal | None
-    volume_usd: Decimal
-    volume_24h_usd: Decimal
-    liquidity_usd: Decimal
 
 
 # ---------------------------------------------------------------------------
@@ -559,12 +561,13 @@ class PolymarketService:
     ) -> RawOrderbook:
         """
         Normalise CLOB API response ke RawOrderbook.
+        
+        CLOB API only provides live prices (probability from token price, bid/ask from orderbook).
+        Volume/liquidity come from Gamma API (stored in Market table).
 
         Sources:
           market_data (dari /markets/{condition_id}):
-            - price dari tokens[0].price
-            - volume dari market_data.volume
-            - liquidity dari market_data.liquidity
+            - probability dari tokens[0].price
           
           orderbook_data (dari /book?token_id=):
             - best_bid dari bids[0]
@@ -591,20 +594,6 @@ class PolymarketService:
         # Clamp [0, 1]
         probability_yes = max(Decimal("0"), min(Decimal("1"), probability_yes))
         probability_no = Decimal("1") - probability_yes
-
-        # Volume dan liquidity dari market_data
-        volume_usd = self._safe_decimal(
-            market_data.get("volume") or market_data.get("volumeNum") or 0
-        )
-        volume_24h_usd = self._safe_decimal(
-            market_data.get("volume24hr")
-            or market_data.get("volume24h")
-            or market_data.get("volume_24h")
-            or 0
-        )
-        liquidity_usd = self._safe_decimal(
-            market_data.get("liquidity") or market_data.get("liquidityNum") or 0
-        )
 
         # Bid/ask dari orderbook_data jika tersedia
         best_bid: Decimal | None = None
@@ -643,9 +632,6 @@ class PolymarketService:
             best_bid=best_bid,
             best_ask=best_ask,
             spread=spread,
-            volume_usd=volume_usd,
-            volume_24h_usd=volume_24h_usd,
-            liquidity_usd=liquidity_usd,
         )
 
     # =========================================================================

@@ -177,8 +177,6 @@ class MarketRepository:
         session: Session,
         market_id: int,
         probability: Decimal,
-        volume_usd: Decimal,
-        liquidity_usd: Decimal,
     ) -> None:
         """
         Update the denormalized probability cache on the markets table.
@@ -186,14 +184,16 @@ class MarketRepository:
         This is called by the snapshot collector after each snapshot write.
         It keeps markets.market_probability current so the dashboard never
         needs to JOIN market_snapshots for the latest value.
+        
+        NOTE: volume_usd and liquidity_usd are NOT updated here.
+        They come from Gamma API (via MarketsCollector) and are only
+        refreshed during market discovery, not on every price snapshot.
         """
         session.execute(
             update(Market)
             .where(Market.id == market_id)
             .values(
                 market_probability=probability,
-                volume_usd=volume_usd,
-                liquidity_usd=liquidity_usd,
                 last_synced_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             )

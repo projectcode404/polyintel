@@ -239,12 +239,11 @@ class SnapshotsCollector:
                     if written:
                         result.snapshots_written += 1
                         # Update denormalized cache on markets table
+                        # Volume/liquidity come from Gamma API (in market table), not CLOB API
                         self._market_repo.update_probability_cache(
                             session,
                             market_id=market.id,
                             probability=orderbook.probability_yes,
-                            volume_usd=orderbook.volume_usd,
-                            liquidity_usd=orderbook.liquidity_usd,
                         )
                     else:
                         result.snapshots_skipped += 1
@@ -307,9 +306,9 @@ class SnapshotsCollector:
             best_bid=orderbook.best_bid,
             best_ask=orderbook.best_ask,
             spread=orderbook.spread,
-            volume_usd=orderbook.volume_usd,
-            volume_24h_usd=orderbook.volume_24h_usd,
-            liquidity_usd=orderbook.liquidity_usd,
+            volume_usd=market.volume_usd,
+            volume_24h_usd=market.volume_24h_usd,
+            liquidity_usd=market.liquidity_usd,
             snapshotted_at=snapshotted_at,
             btc_price_usd=context.btc_price_usd,
             eth_price_usd=context.eth_price_usd,
