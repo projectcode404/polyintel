@@ -101,21 +101,26 @@ class EdgeCalculator:
 
         # Rule 4: Time Decay (Near Expiry)
         if market.end_date:
-            # Pastikan market.end_date memiliki zona waktu UTC jika belum ada
-            end_date = market.end_date
-
-        if end_date.tzinfo is None:
-            end_date = end_date.replace(tzinfo=timezone.utc)
-        
-        hours_to_expiry = (end_date - now).total_seconds() / 3600
-    
-        if 0 < hours_to_expiry < 48:
-            if Decimal("0.40") <= prob_yes <= Decimal("0.60"):
-                signals.append({
-                "direction": "yes",
-                "trigger_source": "rule_4_time_decay",
-                "edge": 0.05,
-                "context": context
-            })            
+            # 1. Pastikan now adalah UTC aware
+            now_utc = datetime.now(timezone.utc)
+            
+            # 2. Defensif: Ambil end_date, jika naive maka buat jadi UTC, 
+            # jika sudah aware maka pastikan tetap UTC
+            market_end = market.end_date
+            if market_end.tzinfo is None:
+                market_end = market_end.replace(tzinfo=timezone.utc)
+            else:
+                market_end = market_end.astimezone(timezone.utc)
+                
+            hours_to_expiry = (market_end - now_utc).total_seconds() / 3600
+            
+            if 0 < hours_to_expiry < 48:
+                if Decimal("0.40") <= prob_yes <= Decimal("0.60"):
+                    signals.append({
+                        "direction": "yes",
+                        "trigger_source": "rule_4_time_decay",
+                        "edge": 0.05,
+                        "context": context
+                    })
 
         return signals
