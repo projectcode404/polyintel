@@ -34,17 +34,7 @@
 @push('styles')
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.2/styles/ag-grid.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.2/styles/ag-theme-alpine.css">
-<style>
-    .ag-theme-alpine .ag-header { background-color: #f8fafc; font-weight: 600; }
-    .ag-theme-alpine .ag-row-hover { background-color: #f0f7ff !important; cursor: pointer; }
-    .prob-high  { color: #2fb344; font-weight: 600; }
-    .prob-low   { color: #e63946; font-weight: 600; }
-    .prob-mid   { color: #f76707; font-weight: 600; }
-    .badge-bitcoin  { background: #f7931a22; color: #f7931a; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
-    .badge-ethereum { background: #627eea22; color: #627eea; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
-    .badge-solana   { background: #9945ff22; color: #9945ff; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
-    .badge-other    { background: #6c757d22; color: #6c757d; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
-</style>
+@include('partials.ui.grid-styles')
 @endpush
 
 @push('scripts')

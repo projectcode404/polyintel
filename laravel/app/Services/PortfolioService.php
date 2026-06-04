@@ -27,15 +27,17 @@ final class PortfolioService
     }
 
     /**
-     * Update trading account settings
+     * Update trading account settings.
+     * Expects explicit boolean values for both flags (caller must send 0/1 for OFF/ON).
      */
     public function updateSettings(TradingAccount $account, array $data): TradingAccount
     {
         $account->update([
-            'is_auto_trade' => $data['is_auto_trade'] ?? $account->is_auto_trade,
-            'is_auto_close' => $data['is_auto_close'] ?? $account->is_auto_close,
+            'is_auto_trade' => (bool) $data['is_auto_trade'],
+            'is_auto_close' => (bool) $data['is_auto_close'],
         ]);
-        return $account;
+
+        return $account->refresh();
     }
 
     /**

@@ -1,113 +1,164 @@
 @extends('layouts.app')
 
-@section('content')
-<div class="container-xl">
-    <div class="page-header d-print-none">
-        <div class="row align-items-center">
-            <div class="col">
-                <h2 class="page-title">
-                    Trading Signals
-                </h2>
-                <div class="text-muted mt-1">Pending and active signals from Python engine</div>
-            </div>
-        </div>
-    </div>
-</div>
+@section('title', 'Signals')
+@section('page-title', 'Signals')
+@section('page-subtitle', 'Pending and active signals from the Python rules engine')
 
-<div class="page-body">
-    <div class="container-xl">
-        @if(session('success'))
-            <div class="alert alert-success">{{ session('success') }}</div>
-        @endif
-        @if(session('error'))
-            <div class="alert alert-danger">{{ session('error') }}</div>
-        @endif
-
-        <div class="card">
-            <div class="table-responsive">
-                <table class="table card-table table-vcenter text-nowrap datatable">
-                    <thead>
-                        <tr>
-                            <th>Market</th>
-                            <th>Rule Trigger</th>
-                            <th>Direction</th>
-                            <th>Prob Entry</th>
-                            <th>Edge</th>
-                            <th>Status</th>
-                            <th>Fired At</th>
-                            <th>Context</th>
-                            <th>Action</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        @foreach($signals as $signal)
-                        <tr>
-                            <td>
-                                <a href="{{ route('markets.show', $signal->market_id) }}" class="text-reset" tabindex="-1">
-                                    {{ Str::limit($signal->market->question, 40) }}
-                                </a>
-                            </td>
-                            <td>
-                                <span class="badge bg-purple-lt">{{ $signal->trigger_source }}</span>
-                            </td>
-                            <td>
-                                @if($signal->direction === 'yes')
-                                    <span class="badge bg-success">BUY YES</span>
-                                @else
-                                    <span class="badge bg-danger">BUY NO</span>
-                                @endif
-                            </td>
-                            <td>{{ number_format($signal->market_probability_at_signal * 100, 1) }}%</td>
-                            <td>{{ number_format($signal->edge_at_signal * 100, 1) }}%</td>
-                            <td>
-                                @if($signal->status === 'pending')
-                                    <span class="badge bg-warning">Pending</span>
-                                @elseif($signal->status === 'active')
-                                    <span class="badge bg-info">Active</span>
-                                @else
-                                    <span class="badge bg-secondary">{{ ucfirst($signal->status) }}</span>
-                                @endif
-                            </td>
-                            <td>{{ $signal->fired_at->diffForHumans() }}</td>
-                            <td>
-                                <button type="button" class="btn btn-sm btn-ghost-secondary" data-bs-toggle="popover" title="Snapshot Context" data-bs-content="{{ json_encode($signal->snapshot_data) }}">
-                                    View Data
-                                </button>
-                            </td>
-                            <td>
-                                @if($signal->status === 'pending')
-                                    <form action="{{ route('signals.execute', $signal->id) }}" method="POST" class="d-inline">
-                                        @csrf
-                                        <button type="submit" class="btn btn-sm btn-primary">Execute</button>
-                                    </form>
-                                    <form action="{{ route('signals.ignore', $signal->id) }}" method="POST" class="d-inline">
-                                        @csrf
-                                        <button type="submit" class="btn btn-sm btn-ghost-danger">Ignore</button>
-                                    </form>
-                                @endif
-                            </td>
-                        </tr>
-                        @endforeach
-                    </tbody>
-                </table>
-            </div>
-            @if($signals->hasPages())
-            <div class="card-footer d-flex align-items-center">
-                {{ $signals->links() }}
-            </div>
-            @endif
-        </div>
-    </div>
+@section('page-actions')
+<div class="d-flex gap-2 align-items-center flex-wrap">
+    <select id="filterStatus" class="form-select form-select-sm" style="width: auto">
+        <option value="">All Status</option>
+        <option value="pending" selected>Pending</option>
+        <option value="active">Active</option>
+        <option value="cancelled">Cancelled</option>
+        <option value="closed">Closed</option>
+    </select>
+    <select id="filterDirection" class="form-select form-select-sm" style="width: auto">
+        <option value="">All Directions</option>
+        <option value="yes">BUY YES</option>
+        <option value="no">BUY NO</option>
+    </select>
+    <span class="text-muted small d-flex align-items-center" id="tableRowCount"></span>
 </div>
 @endsection
 
+@section('content')
+@component('partials.ui.data-table-card', ['tableId' => 'signalsTable'])
+    <thead>
+        <tr>
+            <th>Market Question</th>
+            <th>Rule Trigger</th>
+            <th>Direction</th>
+            <th>Prob Entry</th>
+            <th>Edge</th>
+            <th>Status</th>
+            <th>Fired At (UTC)</th>
+            <th>Context</th>
+            <th>Action</th>
+        </tr>
+    </thead>
+    <tbody>
+        @forelse($signals as $signal)
+        <tr data-status="{{ $signal->status }}" data-direction="{{ $signal->direction }}">
+            <td>
+                <a href="{{ route('markets.show', $signal->market_id) }}" class="market-link" title="{{ $signal->market->question }}">
+                    {{ Str::limit($signal->market->question, 48) }}
+                </a>
+            </td>
+            <td>
+                <span class="badge-rule">{{ $signal->trigger_source }}</span>
+            </td>
+            <td>
+                @if($signal->direction === 'yes')
+                    <span class="prob-high">BUY YES</span>
+                @else
+                    <span class="prob-low">BUY NO</span>
+                @endif
+            </td>
+            <td>
+                @include('partials.ui.probability-bar', ['value' => $signal->market_probability_at_signal])
+            </td>
+            <td>
+                @php $edgePct = round($signal->edge_at_signal * 100, 1); @endphp
+                <span class="{{ $edgePct >= 0 ? 'edge-positive' : 'edge-negative' }}">
+                    {{ $edgePct >= 0 ? '+' : '' }}{{ $edgePct }}%
+                </span>
+            </td>
+            <td>
+                @if($signal->status === 'pending')
+                    <span class="badge bg-warning-lt">Pending</span>
+                @elseif($signal->status === 'active')
+                    <span class="badge bg-success-lt">Active</span>
+                @elseif($signal->status === 'cancelled')
+                    <span class="badge bg-secondary-lt">Cancelled</span>
+                @else
+                    <span class="badge bg-blue-lt">{{ ucfirst($signal->status) }}</span>
+                @endif
+            </td>
+            <td class="text-meta">{{ $signal->fired_at->utc()->format('M d, H:i') }}</td>
+            <td>
+                @if($signal->snapshot_data)
+                <button type="button"
+                        class="btn btn-sm btn-outline-secondary"
+                        data-bs-toggle="popover"
+                        data-bs-trigger="focus"
+                        title="Snapshot Context"
+                        data-bs-content="{{ e(json_encode($signal->snapshot_data)) }}">
+                    View
+                </button>
+                @else
+                <span class="text-meta">—</span>
+                @endif
+            </td>
+            <td>
+                @if($signal->status === 'pending')
+                <div class="d-flex gap-1">
+                    <form action="{{ route('signals.execute', $signal->id) }}" method="POST" class="d-inline">
+                        @csrf
+                        <button type="submit" class="btn btn-sm btn-primary">Execute</button>
+                    </form>
+                    <form action="{{ route('signals.ignore', $signal->id) }}" method="POST" class="d-inline">
+                        @csrf
+                        <button type="submit" class="btn btn-sm btn-outline-danger">Ignore</button>
+                    </form>
+                </div>
+                @else
+                <span class="text-meta">—</span>
+                @endif
+            </td>
+        </tr>
+        @empty
+        <tr>
+            <td colspan="9" class="text-center text-meta py-5">No signals found.</td>
+        </tr>
+        @endforelse
+    </tbody>
+    @if($signals->hasPages())
+    @slot('footer')
+        {{ $signals->links() }}
+    @endslot
+    @endif
+@endcomponent
+@endsection
+
+@push('styles')
+@include('partials.ui.grid-styles')
+@endpush
+
 @push('scripts')
 <script>
-    document.addEventListener("DOMContentLoaded", function() {
-        var popoverTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="popover"]'))
-        var popoverList = popoverTriggerList.map(function (popoverTriggerEl) {
-            return new bootstrap.Popover(popoverTriggerEl)
-        })
+document.addEventListener('DOMContentLoaded', function () {
+    const table = document.getElementById('signalsTable');
+    const rows = table ? Array.from(table.querySelectorAll('tbody tr[data-status]')) : [];
+    const countEl = document.getElementById('tableRowCount');
+    const filterStatus = document.getElementById('filterStatus');
+    const filterDirection = document.getElementById('filterDirection');
+
+    function applyFilters() {
+        const status = filterStatus.value;
+        const direction = filterDirection.value;
+        let visible = 0;
+
+        rows.forEach(row => {
+            const matchStatus = !status || row.dataset.status === status;
+            const matchDir = !direction || row.dataset.direction === direction;
+            const show = matchStatus && matchDir;
+            row.dataset.hidden = show ? 'false' : 'true';
+            if (show) visible++;
+        });
+
+        countEl.textContent = visible.toLocaleString() + ' signals';
+    }
+
+    [filterStatus, filterDirection].forEach(el => {
+        el.addEventListener('change', applyFilters);
     });
+
+    applyFilters();
+
+    document.querySelectorAll('[data-bs-toggle="popover"]').forEach(el => {
+        new bootstrap.Popover(el);
+    });
+});
 </script>
 @endpush

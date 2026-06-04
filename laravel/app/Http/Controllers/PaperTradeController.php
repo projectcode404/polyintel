@@ -46,14 +46,17 @@ class PaperTradeController extends Controller
     
     public function updateSettings(Request $request, PortfolioService $portfolioService)
     {
-        $request->validate([
-            'is_auto_trade' => 'boolean',
-            'is_auto_close' => 'boolean',
+        $validated = $request->validate([
+            'is_auto_trade' => 'required|in:0,1',
+            'is_auto_close' => 'required|in:0,1',
         ]);
-        
+
         $account = $portfolioService->getAccountForUser(Auth::user());
-        $portfolioService->updateSettings($account, $request->all());
-        
+        $portfolioService->updateSettings($account, [
+            'is_auto_trade' => (bool) (int) $validated['is_auto_trade'],
+            'is_auto_close' => (bool) (int) $validated['is_auto_close'],
+        ]);
+
         return back()->with('success', 'Settings updated.');
     }
 }
