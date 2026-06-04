@@ -158,19 +158,12 @@ document.addEventListener('DOMContentLoaded', function () {
         },
         {
             headerName: 'Context',
-            field: 'snapshot_data',
-            width: 90,
-            filter: false,
-            sortable: false,
+            field: 'market_id', // Ambil data market_id
             cellRenderer: params => {
-                if (!params.value) return '<span class="text-muted">—</span>';
-                return `<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-2 view-context-btn" style="font-size:11px;">View</button>`;
-            },
-            onCellClicked: params => {
-                if (params.value && params.colDef.headerName === 'Context') {
-                    modalJsonContent.textContent = JSON.stringify(params.value, null, 4);
-                    contextModal.show();
-                }
+                const marketId = params.value;
+                return `<a href="/markets/${marketId}" class="btn btn-sm btn-outline-info">
+                            View Market
+                        </a>`;
             }
         },
         {
