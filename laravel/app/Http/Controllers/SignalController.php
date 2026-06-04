@@ -7,25 +7,43 @@ namespace App\Http\Controllers;
 use App\Models\Signal;
 use App\Models\TradingAccount;
 use App\Services\PaperTradingService;
+use App\Services\PortfolioService;
 use App\Services\SignalService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 
 class SignalController extends Controller
 {
+    public function index()
+    {
+        $signals = Signal::with('market')->latest('fired_at')->paginate(50);
+        return view('signals.index', compact('signals'));
+    }
+
+    // INI ADALAH FUNGSI EXECUTE YANG DIPAKAI
     public function execute(Signal $signal, PaperTradingService $tradingService, PortfolioService $portfolioService)
     {
         $account = $portfolioService->getAccountForUser(Auth::user());
         
-        $trade = $tradingService->openTrade($signal, $account);
+        try {
+            $trade = $tradingService->openTrade($signal, $account);
 
-        if ($trade) {
-            // Sukses: Bawa user langsung ke halaman Paper Trades
-            return redirect()->route('paper-trades.index')
-                             ->with('success', 'Signal berhasil dieksekusi menjadi Paper Trade!');
+            if ($trade) {
+                // Sukses: Bawa user langsung ke halaman Paper Trades
+                return redirect()->route('paper-trades.index')
+                                 ->with('success', 'Signal berhasil dieksekusi menjadi Paper Trade!');
+            }
+
+            return back()->with('error', 'Gagal mengeksekusi signal. Pastikan balance cukup dan status signal masih pending.');
+        } catch (\Exception $e) {
+            return back()->with('error', $e->getMessage());
         }
+    }
 
-        return back()->with('error', 'Gagal mengeksekusi signal. Pastikan balance cukup dan status signal masih pending.');
+    public function ignore(Signal $signal, SignalService $signalService)
+    {
+        $signalService->ignoreSignal($signal);
+        return back()->with('success', 'Signal ignored.');
     }
 
     // Endpoint API untuk AG Grid
@@ -81,35 +99,5 @@ class SignalController extends Controller
             'rows' => $rows,
             'totalRows' => $totalRows
         ]);
-    }
-    
-    public function index()
-    {
-        $signals = Signal::with('market')->latest('fired_at')->paginate(50);
-        return view('signals.index', compact('signals'));
-    }
-
-    public function execute(Signal $signal, PaperTradingService $tradingService)
-    {
-        $account = TradingAccount::where('user_id', Auth::id())->first();
-        if (!$account) {
-            return back()->with('error', 'Trading account not configured.');
-        }
-
-        try {
-            $trade = $tradingService->openTrade($signal, $account);
-            if ($trade) {
-                return back()->with('success', 'Trade executed successfully.');
-            }
-            return back()->with('error', 'Trade could not be executed (e.g. low balance or expired).');
-        } catch (\Exception $e) {
-            return back()->with('error', $e->getMessage());
-        }
-    }
-
-    public function ignore(Signal $signal, SignalService $signalService)
-    {
-        $signalService->ignoreSignal($signal);
-        return back()->with('success', 'Signal ignored.');
     }
 }
