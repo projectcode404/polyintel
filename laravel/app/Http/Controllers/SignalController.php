@@ -73,12 +73,12 @@ class SignalController extends Controller
         }
 
         // 3. Pagination
-        $startRow = (int) $request->input('startRow', 0);
-        $endRow = (int) $request->input('endRow', 100);
-        $limit = $endRow - $startRow;
+        $startRow  = (int) $request->input('startRow', 0);
+        $endRow    = (int) $request->input('endRow', 100);
+        $limit     = max(1, $endRow - $startRow);
 
-        $totalRows = $query->count();
-        $signals = $query->offset($startRow)->limit($limit)->get();
+        $totalRows = (clone $query)->count();  // ← clone agar tidak mutate
+        $signals   = $query->offset($startRow)->limit($limit)->get();
 
         $rows = $signals->map(function ($sig) {
             return [

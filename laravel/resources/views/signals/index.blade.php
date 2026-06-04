@@ -69,6 +69,17 @@ document.addEventListener('DOMContentLoaded', function () {
     const contextModal = new bootstrap.Modal(document.getElementById('contextModal'));
     const modalJsonContent = document.getElementById('modalJsonContent');
 
+    window.showContext = function(btn) {
+        try {
+            const raw = btn.getAttribute('data-json');
+            const parsed = JSON.parse(raw);
+            modalJsonContent.textContent = JSON.stringify(parsed, null, 2);
+        } catch (e) {
+            modalJsonContent.textContent = btn.getAttribute('data-json') || '{}';
+        }
+        contextModal.show();
+    };
+
     // ---- Column Definitions ----
     const columnDefs = [
         {
@@ -158,12 +169,18 @@ document.addEventListener('DOMContentLoaded', function () {
         },
         {
             headerName: 'Context',
-            field: 'market_id', // Ambil data market_id
+            field: 'snapshot_data',
+            width: 110,
+            filter: false,
+            sortable: false,
             cellRenderer: params => {
-                const marketId = params.value;
-                return `<a href="/markets/${marketId}" class="btn btn-sm btn-outline-info">
-                            View Market
-                        </a>`;
+                if (!params.value) return '<span class="text-muted">—</span>';
+                return `<button 
+                            class="btn btn-sm btn-outline-secondary py-0 px-2" 
+                            style="font-size:11px;"
+                            onclick="showContext(this)"
+                            data-json='${JSON.stringify(params.value).replace(/'/g, "&#39;")}'
+                        >JSON</button>`;
             }
         },
         {
