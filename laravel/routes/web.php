@@ -72,4 +72,8 @@ Route::middleware(['auth'])->prefix('api')->name('api.')->group(function () {
         ->name('markets.snapshots.grid');
     Route::get('/markets/{market}/chart', [MarketController::class, 'chartData'])
         ->name('markets.chart');
+    Route::get('/signals/grid', [SignalController::class, 'gridData'])
+        ->name('signals.grid');
+    Route::get('/paper-trades/grid', [PaperTradeController::class, 'gridData'])
+        ->name('paper-trades.grid');
 });
