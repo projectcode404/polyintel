@@ -270,8 +270,10 @@ def main() -> None:
 
     # 5. Register jobs
     # run_date=None + next_run_time override fires immediately at startup
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
     now = _dt.now(_tz.utc)
+    startup_delay = _td(seconds=90)   # buffer: markets collector ~30-60s
 
     _scheduler.add_job(
         job_collect_markets,
@@ -279,7 +281,16 @@ def main() -> None:
         minutes=settings.market_sync_interval_minutes,
         id="collect_markets",
         name="Market Sync (Gamma API)",
-        next_run_time=now,   # Run immediately on startup
+        next_run_time=now,
+    )
+
+    _scheduler.add_job(
+        job_collect_stats,
+        trigger="interval",
+        minutes=60,
+        id="collect_stats",
+        name="Daily Stats Precomputation",
+        next_run_time=now + startup_delay,
     )
 
     _scheduler.add_job(
@@ -288,25 +299,16 @@ def main() -> None:
         minutes=settings.snapshot_interval_minutes,
         id="collect_snapshots",
         name="Snapshot Collection (CLOB API)",
-        next_run_time=now,   # Run immediately on startup
-    )
-
-    _scheduler.add_job(
-        job_collect_stats,
-        trigger="interval",
-        minutes=60, # Every hour
-        id="collect_stats",
-        name="Daily Stats Precomputation",
-        next_run_time=now,   # Run immediately on startup
+        next_run_time=now + startup_delay,
     )
 
     _scheduler.add_job(
         job_collect_signals,
         trigger="interval",
-        minutes=settings.snapshot_interval_minutes, # Same as snapshots
+        minutes=settings.snapshot_interval_minutes,
         id="collect_signals",
         name="Signal Generation (Rules)",
-        next_run_time=now,   # Run immediately on startup
+        next_run_time=now + startup_delay,
     )
 
 

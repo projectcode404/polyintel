@@ -25,10 +25,21 @@ Changelog:
     num_traders tetap di-upsert (= 0) agar kolom DB tidak berubah.
     Kolom baru di markets table WAJIB ada via migration sebelum deploy.
     Lihat migration: add_market_enrichment_fields.
+
+  v1.4 — tambah MarketDTO dan get_active_tracked_dto().
+    FIX: SnapshotsCollector dan SignalCollector mengakses market data
+    DI LUAR session context. ORM objects raise DetachedInstanceError
+    ketika diakses setelah session ditutup karena lazy-load tidak bisa
+    berjalan tanpa session aktif.
+    SOLUTION: get_active_tracked_dto() mengembalikan plain dataclass
+    (MarketDTO) — tidak terikat session, aman diakses kapan saja.
+    get_active_tracked() tetap ada untuk caller yang membutuhkan
+    ORM objects di dalam session yang sama.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -43,6 +54,53 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
+
+# =============================================================================
+# DTO — plain data object, tidak terikat SQLAlchemy session
+# =============================================================================
+
+@dataclass
+class MarketDTO:
+    """
+    Plain data object yang merepresentasikan satu row dari markets table.
+
+    KAPAN DIPAKAI:
+      Gunakan MarketDTO (bukan Market ORM object) ketika data market akan
+      diakses DI LUAR get_session() context — misalnya setelah session
+      ditutup dan digunakan di thread lain.
+
+      Contoh yang SALAH (DetachedInstanceError):
+        with get_session() as session:
+            markets = repo.get_active_tracked(session)
+        # Session sudah ditutup di sini!
+        for m in markets:
+            print(m.condition_id)  # ← DetachedInstanceError
+
+      Contoh yang BENAR (pakai DTO):
+        with get_session() as session:
+            markets = repo.get_active_tracked_dto(session)
+        # Session sudah ditutup, tapi DTO tetap aman diakses
+        for m in markets:
+            print(m.condition_id)  # ← OK
+
+    FIELDS:
+      Hanya berisi fields yang dibutuhkan oleh SnapshotsCollector
+      dan SignalCollector. Bukan seluruh kolom markets table.
+      Tambah field di sini jika collector butuh data tambahan.
+    """
+    id: int
+    condition_id: str
+    question: str
+    status: str
+    volume_usd: Decimal
+    volume_24h_usd: Decimal
+    liquidity_usd: Decimal
+    market_probability: Optional[Decimal]
+
+
+# =============================================================================
+# Repository
+# =============================================================================
 
 class MarketRepository:
     """
@@ -179,7 +237,12 @@ class MarketRepository:
 
     def get_active_tracked(self, session: Session) -> list[Market]:
         """
-        Return all active, tracked markets for snapshot collection.
+        Return all active, tracked markets sebagai ORM objects.
+
+        PERINGATAN: Gunakan method ini HANYA jika data akan diakses
+        di dalam session context yang sama. Jika data perlu diakses
+        setelah session ditutup, gunakan get_active_tracked_dto().
+
         Ordered by volume descending so high-value markets are
         snapshotted first if the batch is interrupted.
         """
@@ -194,6 +257,61 @@ class MarketRepository:
                 .order_by(Market.volume_usd.desc())
             ).scalars().all()
         )
+
+    def get_active_tracked_dto(self, session: Session) -> list[MarketDTO]:
+        """
+        Return all active, tracked markets sebagai plain MarketDTO objects.
+
+        KAPAN DIPAKAI:
+          Gunakan method ini ketika data market akan diakses DI LUAR
+          get_session() context. ORM objects (get_active_tracked) akan
+          raise DetachedInstanceError setelah session ditutup.
+
+          SnapshotsCollector dan SignalCollector WAJIB memakai method ini
+          karena mereka load markets dalam satu session, kemudian
+          memproses data tersebut di thread berbeda atau setelah
+          session block selesai.
+
+        IMPLEMENTATION:
+          Menggunakan select() column-level (bukan select(Market)) agar
+          SQLAlchemy tidak membuat ORM objects — hanya plain Row objects
+          yang langsung dikonversi ke MarketDTO dataclass.
+          Tidak ada lazy-load, tidak ada session dependency.
+
+        Ordered by volume descending — sama dengan get_active_tracked().
+        """
+        rows = session.execute(
+            select(
+                Market.id,
+                Market.condition_id,
+                Market.question,
+                Market.status,
+                Market.volume_usd,
+                Market.volume_24h_usd,
+                Market.liquidity_usd,
+                Market.market_probability,
+            )
+            .where(
+                Market.status == "active",
+                Market.is_tracked.is_(True),
+                Market.deleted_at.is_(None),
+            )
+            .order_by(Market.volume_usd.desc())
+        ).all()
+
+        return [
+            MarketDTO(
+                id=row.id,
+                condition_id=row.condition_id,
+                question=row.question,
+                status=row.status,
+                volume_usd=row.volume_usd,
+                volume_24h_usd=row.volume_24h_usd,
+                liquidity_usd=row.liquidity_usd,
+                market_probability=row.market_probability,
+            )
+            for row in rows
+        ]
 
     def update_probability_cache(
         self,

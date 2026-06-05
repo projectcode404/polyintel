@@ -7,6 +7,26 @@ Changelog:
           mark_resolved di DB sehingga market tidak di-snapshot lagi.
           Sebelumnya: market closed di-skip setiap run → log error spam.
           Sekarang:   market closed di-mark resolved sekali → hilang dari queue.
+
+  v1.5 — FIX DetachedInstanceError: ganti get_active_tracked() dengan
+          get_active_tracked_dto().
+
+          ROOT CAUSE:
+            _load_tracked_markets() membuka session, fetch ORM objects,
+            lalu menutup session. ORM objects yang dikembalikan menjadi
+            "detached" — mereka masih terikat ke session yang sudah tutup.
+            Ketika _process_batch() mengakses m.condition_id, m.volume_usd,
+            dll, SQLAlchemy mencoba lazy-load → DetachedInstanceError.
+            Error ini di-swallow oleh except block di _process_batch()
+            sehingga tidak muncul di log — silent failure.
+
+          FIX:
+            get_active_tracked_dto() mengembalikan plain MarketDTO dataclass.
+            DTO tidak terikat session — aman diakses kapan saja, di thread
+            mana saja, setelah session ditutup.
+
+          JUGA FIX:
+            Import MarketDTO dari market_repository agar type hints akurat.
 """
 
 from __future__ import annotations
@@ -18,7 +38,7 @@ from datetime import datetime, timezone
 from config.settings import settings
 from utils.db import get_session
 from utils.logger import get_logger
-from repositories.market_repository import MarketRepository
+from repositories.market_repository import MarketRepository, MarketDTO
 from repositories.snapshot_repository import SnapshotRepository
 from services.polymarket_service import (
     PolymarketService,
@@ -83,16 +103,20 @@ class SnapshotsCollector:
 
             markets_to_process = markets[: settings.snapshot_batch_size]
             if len(markets_to_process) < total:
-                log.warning("snapshots_batch_capped", total=total, cap=settings.snapshot_batch_size)
+                log.warning(
+                    "snapshots_batch_capped",
+                    total=total,
+                    cap=settings.snapshot_batch_size,
+                )
 
             batches = self._chunk(markets_to_process, COMMIT_BATCH_SIZE)
             for batch_num, batch in enumerate(batches, start=1):
                 batch_result = self._process_batch(batch, context, batch_num)
-                result.snapshots_written += batch_result.snapshots_written
-                result.snapshots_skipped += batch_result.snapshots_skipped
-                result.markets_failed += batch_result.markets_failed
-                result.markets_closed += batch_result.markets_closed
-                result.markets_processed += batch_result.markets_processed
+                result.snapshots_written  += batch_result.snapshots_written
+                result.snapshots_skipped  += batch_result.snapshots_skipped
+                result.markets_failed     += batch_result.markets_failed
+                result.markets_closed     += batch_result.markets_closed
+                result.markets_processed  += batch_result.markets_processed
 
         except Exception as exc:
             log.exception("snapshots_collection_unexpected_error", error=str(exc))
@@ -119,9 +143,23 @@ class SnapshotsCollector:
     # Private
     # -------------------------------------------------------------------------
 
-    def _load_tracked_markets(self) -> list:
+    def _load_tracked_markets(self) -> list[MarketDTO]:
+        """
+        Load active tracked markets sebagai plain DTO objects.
+
+        WAJIB menggunakan get_active_tracked_dto() — BUKAN get_active_tracked().
+
+        Alasan: session ditutup setelah with-block selesai. ORM objects
+        yang dikembalikan oleh get_active_tracked() akan menjadi detached
+        dan raise DetachedInstanceError ketika diakses di _process_batch().
+        Error ini silent — di-swallow oleh except block — sehingga sangat
+        sulit di-debug di production.
+
+        MarketDTO adalah plain dataclass, tidak terikat session.
+        Aman diakses kapan saja setelah session ditutup.
+        """
         with get_session() as session:
-            return self._market_repo.get_active_tracked(session)
+            return self._market_repo.get_active_tracked_dto(session)
 
     def _fetch_external_context(self) -> ExternalPriceContext:
         try:
@@ -138,7 +176,7 @@ class SnapshotsCollector:
 
     def _process_batch(
         self,
-        markets: list,
+        markets: list[MarketDTO],
         context: ExternalPriceContext,
         batch_num: int,
     ) -> SnapshotCollectionResult:
@@ -260,7 +298,7 @@ class SnapshotsCollector:
     def _write_snapshot(
         self,
         session,
-        market,
+        market: MarketDTO,
         orderbook: RawOrderbook,
         context: ExternalPriceContext,
         snapshotted_at: datetime,
@@ -274,7 +312,6 @@ class SnapshotsCollector:
             best_ask=orderbook.best_ask,
             spread=orderbook.spread,
             volume_usd=market.volume_usd,
-            # FIX: rolling 24h volume, bukan total lifetime volume
             volume_24h_usd=market.volume_24h_usd,
             liquidity_usd=market.liquidity_usd,
             snapshotted_at=snapshotted_at,
