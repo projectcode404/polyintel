@@ -9,6 +9,7 @@ misconfiguration, so the process fails fast rather than silently misbehaving.
 from __future__ import annotations
 from urllib.parse import quote_plus
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 
 
 class Settings(BaseSettings):
@@ -78,6 +79,13 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Computed properties
     # -------------------------------------------------------------------------
+
+    @field_validator("snapshot_batch_size")   # ← tambah sebelum @property database_url
+    @classmethod
+    def validate_batch_size(cls, v: int) -> int:
+        if v < 50:
+            raise ValueError("snapshot_batch_size minimum 50")
+        return v
 
     @property
     def database_url(self) -> str:

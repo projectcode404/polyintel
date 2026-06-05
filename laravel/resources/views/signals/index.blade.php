@@ -196,17 +196,15 @@
 <script>
 document.addEventListener('DOMContentLoaded', function () {
 
-    // ---- Modal instances ----
-    const executeModal  = new bootstrap.Modal(document.getElementById('executeSignalModal'));
-    const ignoreModal   = new bootstrap.Modal(document.getElementById('ignoreSignalModal'));
-    const contextModal  = new bootstrap.Modal(document.getElementById('contextModal'));
+    const executeModal     = new bootstrap.Modal(document.getElementById('executeSignalModal'));
+    const ignoreModal      = new bootstrap.Modal(document.getElementById('ignoreSignalModal'));
+    const contextModal     = new bootstrap.Modal(document.getElementById('contextModal'));
     const modalJsonContent = document.getElementById('modalJsonContent');
 
     let pendingExecuteId = null;
     let pendingIgnoreId  = null;
     const snapshotStore  = new Map();
 
-    // ---- Helpers ----
     function probBar(rawVal) {
         const pct   = Math.round(rawVal * 1000) / 10;
         const width = Math.round(rawVal * 100);
@@ -220,7 +218,6 @@ document.addEventListener('DOMContentLoaded', function () {
                 </div>`;
     }
 
-    // ---- Column Definitions ----
     const columnDefs = [
         {
             headerName: 'Market Question',
@@ -286,12 +283,7 @@ document.addEventListener('DOMContentLoaded', function () {
             cellStyle: { justifyContent: 'center' },
             cellRenderer: params => {
                 if (!params.value) return '';
-                const map = {
-                    pending:    'status-pending',
-                    active:     'status-active',
-                    cancelled:  'status-cancelled',
-                    closed:     'status-closed',
-                };
+                const map = { pending: 'status-pending', active: 'status-active', cancelled: 'status-cancelled', closed: 'status-closed' };
                 const cls   = map[params.value] ?? 'status-closed';
                 const label = params.value.charAt(0).toUpperCase() + params.value.slice(1);
                 return `<span class="status-pill ${cls}">${label}</span>`;
@@ -332,15 +324,16 @@ document.addEventListener('DOMContentLoaded', function () {
                 if (!params.data || params.data.status !== 'pending') {
                     return '<span class="text-muted" style="font-size:11px;">—</span>';
                 }
+                
+                const encoded = encodeURIComponent(JSON.stringify(params.data));
                 return `<div class="d-flex gap-1 align-items-center">
-                            <button onclick="openExecuteModal(${params.value}, this)" class="btn btn-sm btn-primary py-0 px-2" style="font-size:11px;">Execute</button>
-                            <button onclick="openIgnoreModal(${params.value}, this)"  class="btn btn-sm btn-outline-danger py-0 px-2" style="font-size:11px;">Ignore</button>
+                            <button onclick="openExecuteModal('${encoded}')" class="btn btn-sm btn-primary py-0 px-2" style="font-size:11px;">Execute</button>
+                            <button onclick="openIgnoreModal('${encoded}')"  class="btn btn-sm btn-outline-danger py-0 px-2" style="font-size:11px;">Ignore</button>
                         </div>`;
             }
         }
     ];
 
-    // ---- Grid Configuration ----
     const gridOptions = {
         columnDefs,
         rowModelType: 'infinite',
@@ -394,7 +387,6 @@ document.addEventListener('DOMContentLoaded', function () {
 
     const grid = agGrid.createGrid(document.getElementById('signalsGrid'), gridOptions);
 
-    // ---- Filter & Refresh ----
     ['filterStatus', 'filterDirection'].forEach(id => {
         document.getElementById(id).addEventListener('change', () => {
             snapshotStore.clear();
@@ -407,23 +399,26 @@ document.addEventListener('DOMContentLoaded', function () {
     });
 
     // ---- Execute Modal ----
-    window.openExecuteModal = function(id, btn) {
-        // Ambil row data dari grid
-        let rowData = null;
-        grid.api?.forEachNode(node => { if (node.data?.id === id) rowData = node.data; });
-
-        pendingExecuteId = id;
+    window.openExecuteModal = function(encoded) {
+        const rowData = JSON.parse(decodeURIComponent(encoded));
+        pendingExecuteId = rowData.id;
 
         document.getElementById('executeModalQuestion').textContent =
-            rowData?.market_question ?? `Signal #${id}`;
-        document.getElementById('executeModalDirection').textContent =
-            rowData?.direction?.toUpperCase() === 'YES' ? '▲ BUY YES' : '▼ BUY NO';
-        document.getElementById('executeModalDirection').className =
-            rowData?.direction?.toLowerCase() === 'yes' ? 'dir-yes' : 'dir-no';
+            rowData.market_question ?? `Signal #${rowData.id}`;
+
+        const isYes = rowData.direction?.toLowerCase() === 'yes';
+        const dirEl = document.getElementById('executeModalDirection');
+        dirEl.textContent = isYes ? '▲ BUY YES' : '▼ BUY NO';
+        dirEl.className   = isYes ? 'dir-yes' : 'dir-no';
+
         document.getElementById('executeModalProb').textContent =
-            rowData ? (parseFloat(rowData.market_probability_at_signal) * 100).toFixed(1) + '%' : '—';
+            rowData.market_probability_at_signal !== null && rowData.market_probability_at_signal !== undefined
+                ? (parseFloat(rowData.market_probability_at_signal) * 100).toFixed(1) + '%'
+                : '—';
+
+        const edge = parseFloat(rowData.edge_at_signal);
         document.getElementById('executeModalEdge').textContent =
-            rowData ? '+' + (parseFloat(rowData.edge_at_signal) * 100).toFixed(1) + '%' : '—';
+            isNaN(edge) ? '—' : (edge >= 0 ? '+' : '') + (edge * 100).toFixed(1) + '%';
 
         executeModal.show();
     };
@@ -437,13 +432,11 @@ document.addEventListener('DOMContentLoaded', function () {
     });
 
     // ---- Ignore Modal ----
-    window.openIgnoreModal = function(id, btn) {
-        let rowData = null;
-        grid.api?.forEachNode(node => { if (node.data?.id === id) rowData = node.data; });
-
-        pendingIgnoreId = id;
+    window.openIgnoreModal = function(encoded) {
+        const rowData = JSON.parse(decodeURIComponent(encoded));
+        pendingIgnoreId = rowData.id;
         document.getElementById('ignoreModalQuestion').textContent =
-            rowData?.market_question ?? `Signal #${id}`;
+            rowData.market_question ?? `Signal #${rowData.id}`;
         ignoreModal.show();
     };
 
@@ -466,13 +459,13 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // ---- Form POST helper ----
     function submitFormPost(url) {
-        const form   = document.createElement('form');
-        form.method  = 'POST';
-        form.action  = url;
-        const token  = document.createElement('input');
-        token.type   = 'hidden';
-        token.name   = '_token';
-        token.value  = document.querySelector('meta[name="csrf-token"]').content;
+        const form  = document.createElement('form');
+        form.method = 'POST';
+        form.action = url;
+        const token = document.createElement('input');
+        token.type  = 'hidden';
+        token.name  = '_token';
+        token.value = document.querySelector('meta[name="csrf-token"]').content;
         form.appendChild(token);
         document.body.appendChild(form);
         form.submit();

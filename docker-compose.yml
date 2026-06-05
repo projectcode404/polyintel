@@ -32,12 +32,25 @@ services:
       - ./python/logs:/app/logs
     networks:
       - sikap-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.75"
+        reservations:
+          memory: 256M
+          cpus: "0.25"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      test: ["CMD", "pgrep", "-f", "scheduler.py"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 20s
 
   # ---------------------------------------------------------------------------
   # Laravel 12 + FrankenPHP — Dashboard
@@ -57,20 +70,30 @@ services:
       # FrankenPHP server config
       SERVER_NAME: ":80"
       # Laravel app config — override dari .env kalau perlu
-      APP_ENV:   ${APP_ENV:-production}
-      APP_DEBUG: ${APP_DEBUG:-false}
+      # APP_ENV:   ${APP_ENV:-production}
+      # APP_DEBUG: ${APP_DEBUG:-false}
     ports:
       - "8088:80"
     volumes:
-      # Mount seluruh Laravel project — live reload tanpa rebuild
       - ./laravel:/app
-      # Persistent storage untuk logs, cache, uploads
       - laravel_storage:/app/storage
     networks:
       - sikap-network
-    depends_on:
-      python:
-        condition: service_healthy
+    # FIX: Laravel tidak depends on Python
+    # Keduanya independent — dashboard tetap jalan kalau collector mati
+    deploy:
+      resources:
+        limits:
+          memory: 768M            # FrankenPHP + PHP workers
+          cpus: "1.0"             # max 1 core untuk web requests
+        reservations:
+          memory: 256M
+          cpus: "0.25"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"             # max 250MB total log Laravel
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80/up"]
       interval: 30s

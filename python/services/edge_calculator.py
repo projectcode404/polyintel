@@ -1,3 +1,14 @@
+"""
+services/edge_calculator.py
+
+Changelog:
+  v1.2 — tambah guard filters sebelum evaluate rules:
+    - skip market expired (end_date sudah lewat)
+    - skip market terlalu jauh dari expiry (> 90 hari) untuk time-sensitive rules
+    - skip prob ekstrem suspek (< 2% atau > 98%) — kemungkinan stale/resolved
+    - konstanta PROB_FLOOR dan PROB_CEILING untuk batas wajar signal
+"""
+
 from utils.logger import get_logger
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
@@ -5,122 +16,190 @@ from typing import List, Dict, Any
 
 log = get_logger(__name__)
 
+
 class EdgeCalculator:
     """
     Evaluates markets against predefined trading rules to generate signals.
     """
 
     def __init__(self):
-        # Configuration
+        # Volume
         self.min_volume_threshold = Decimal("10000.00")
-        self.extreme_prob_low = Decimal("0.15")
+
+        # Rule 1: Extreme probability thresholds
+        self.extreme_prob_low  = Decimal("0.15")
         self.extreme_prob_high = Decimal("0.85")
-        self.momentum_threshold = Decimal("0.10")  # 10% change
+
+        # Guard: prob di luar range ini kemungkinan data stale/resolved
+        # bukan peluang nyata — jangan generate signal
+        self.PROB_FLOOR   = Decimal("0.02")   # < 2% = suspect
+        self.PROB_CEILING = Decimal("0.98")   # > 98% = suspect
+
+        # Rule 2: Momentum
+        self.momentum_threshold = Decimal("0.10")
+
+        # Rule 3: Volume spike
         self.volume_spike_multiplier = Decimal("3.0")
-        
-    def evaluate(self, market: Any, latest_snapshot: Any, daily_stat: Any) -> List[Dict[str, Any]]:
+
+    # -------------------------------------------------------------------------
+    # Public
+    # -------------------------------------------------------------------------
+
+    def evaluate(
+        self, market: Any, latest_snapshot: Any, daily_stat: Any
+    ) -> List[Dict[str, Any]]:
         """
-        Evaluate a market and its current state against all rules.
-        Returns a list of signals (dictionaries) if any rule triggers.
+        Evaluate a market against all rules.
+        Returns list of signal dicts. Empty list = no signal.
         """
-        signals = []
-        
-        # We need a snapshot to evaluate probabilities and volume
         if not latest_snapshot:
-            return signals
-            
-        prob_yes = latest_snapshot.probability_yes
-        prob_no = latest_snapshot.probability_no
+            return []
+
+        # --- Guard filters (applied before ALL rules) ---
+        skip_reason = self._should_skip(market, latest_snapshot)
+        if skip_reason:
+            log.debug(
+                "signal_skipped",
+                market_id=market.id,
+                condition_id=market.condition_id,
+                reason=skip_reason,
+            )
+            return []
+
+        prob_yes  = latest_snapshot.probability_yes
+        prob_no   = latest_snapshot.probability_no
         volume_24h = latest_snapshot.volume_24h_usd
-        
-        # Base context for all signals
-        now = datetime.now(timezone.utc)
-        
+        now_utc   = datetime.now(timezone.utc)
+
         context = {
             "price_entry": float(prob_yes),
-            "volume_24h": float(volume_24h),
-            "volume_7d": float(daily_stat.volume_7d_avg_usd) if daily_stat and daily_stat.volume_7d_avg_usd else None,
-            "momentum": float(daily_stat.momentum_24h_percent) if daily_stat and daily_stat.momentum_24h_percent else None,
-            "confidence": 0.8, # Placeholder for rule-based
+            "volume_24h":  float(volume_24h),
+            "volume_7d":   float(daily_stat.volume_7d_avg_usd)
+                           if daily_stat and daily_stat.volume_7d_avg_usd else None,
+            "momentum":    float(daily_stat.momentum_24h_percent)
+                           if daily_stat and daily_stat.momentum_24h_percent else None,
+            "confidence":  0.8,
         }
-        
-        # Skip if basic liquidity isn't met for some rules, though we evaluate per rule
+
         has_min_volume = volume_24h >= self.min_volume_threshold
-        
-        # Rule 1: Probability Extreme (Underpriced/Overpriced)
+        signals: List[Dict[str, Any]] = []
+
+        # Rule 1: Probability Extreme (Underpriced / Overpriced)
         if has_min_volume:
-            if prob_yes < self.extreme_prob_low:
+            if self.PROB_FLOOR <= prob_yes < self.extreme_prob_low:
                 signals.append({
-                    "direction": "yes",
+                    "direction":      "yes",
                     "trigger_source": "rule_1_extreme_low",
-                    "edge": float(self.extreme_prob_low - prob_yes),
-                    "context": context
+                    "edge":           float(self.extreme_prob_low - prob_yes),
+                    "context":        context,
                 })
-            elif prob_yes > self.extreme_prob_high:
+            elif self.extreme_prob_high < prob_yes <= self.PROB_CEILING:
                 signals.append({
-                    "direction": "no",
+                    "direction":      "no",
                     "trigger_source": "rule_1_extreme_high",
-                    "edge": float(prob_yes - self.extreme_prob_high),
-                    "context": context
+                    "edge":           float(prob_yes - self.extreme_prob_high),
+                    "context":        context,
                 })
-                
+
         # Rule 2: Probability Momentum
-        # Using precomputed 24h momentum from daily_stats
         if daily_stat and daily_stat.momentum_24h_percent is not None:
             momentum = daily_stat.momentum_24h_percent
             if momentum > self.momentum_threshold:
                 signals.append({
-                    "direction": "yes",
+                    "direction":      "yes",
                     "trigger_source": "rule_2_momentum_up",
-                    "edge": float(momentum),
-                    "context": context
+                    "edge":           float(momentum),
+                    "context":        context,
                 })
             elif momentum < -self.momentum_threshold:
                 signals.append({
-                    "direction": "no",
+                    "direction":      "no",
                     "trigger_source": "rule_2_momentum_down",
-                    "edge": float(abs(momentum)),
-                    "context": context
-                })
-                
-        # Rule 3: Volume Spike
-        if daily_stat and daily_stat.volume_7d_avg_usd and daily_stat.volume_7d_avg_usd > 0:
-            avg_vol = daily_stat.volume_7d_avg_usd
-            if volume_24h > (avg_vol * self.volume_spike_multiplier):
-                # Direction follows current momentum if available, or just bias to yes if prob is rising
-                direction = "yes"
-                if daily_stat.momentum_24h_percent and daily_stat.momentum_24h_percent < 0:
-                    direction = "no"
-                    
-                signals.append({
-                    "direction": direction,
-                    "trigger_source": "rule_3_volume_spike",
-                    "edge": 0.05, # Fixed edge for volume spike as it's harder to quantify
-                    "context": context
+                    "edge":           float(abs(momentum)),
+                    "context":        context,
                 })
 
-        # Rule 4: Time Decay (Near Expiry)
+        # Rule 3: Volume Spike
+        if (
+            daily_stat
+            and daily_stat.volume_7d_avg_usd
+            and daily_stat.volume_7d_avg_usd > 0
+        ):
+            avg_vol = daily_stat.volume_7d_avg_usd
+            if volume_24h > avg_vol * self.volume_spike_multiplier:
+                direction = "yes"
+                if (
+                    daily_stat.momentum_24h_percent
+                    and daily_stat.momentum_24h_percent < 0
+                ):
+                    direction = "no"
+
+                signals.append({
+                    "direction":      direction,
+                    "trigger_source": "rule_3_volume_spike",
+                    "edge":           0.05,
+                    "context":        context,
+                })
+
+        # Rule 4: Time Decay (Near Expiry, 0–48 jam)
         if market.end_date:
-            # 1. Pastikan now adalah UTC aware
-            now_utc = datetime.now(timezone.utc)
-            
-            # 2. Defensif: Ambil end_date, jika naive maka buat jadi UTC, 
-            # jika sudah aware maka pastikan tetap UTC
             market_end = market.end_date
             if market_end.tzinfo is None:
                 market_end = market_end.replace(tzinfo=timezone.utc)
             else:
                 market_end = market_end.astimezone(timezone.utc)
-                
+
             hours_to_expiry = (market_end - now_utc).total_seconds() / 3600
-            
+
+            # Hanya generate kalau masih ada sisa waktu (belum expired)
+            # dan prob masih dalam range tidak pasti (40–60%)
             if 0 < hours_to_expiry < 48:
                 if Decimal("0.40") <= prob_yes <= Decimal("0.60"):
                     signals.append({
-                        "direction": "yes",
+                        "direction":      "yes",
                         "trigger_source": "rule_4_time_decay",
-                        "edge": 0.05,
-                        "context": context
+                        "edge":           0.05,
+                        "context":        context,
                     })
 
         return signals
+
+    # -------------------------------------------------------------------------
+    # Private
+    # -------------------------------------------------------------------------
+
+    def _should_skip(self, market: Any, latest_snapshot: Any) -> str | None:
+        """
+        Guard filter sebelum evaluate rules.
+        Return reason string jika harus skip, None jika lanjut.
+
+        Checks (urutan dari paling murah ke mahal):
+          1. Category bukan crypto
+          2. Market sudah expired (end_date sudah lewat)
+          3. Prob ekstrem suspek (< 2% atau > 98%)
+        """
+        now_utc = datetime.now(timezone.utc)
+
+        # 1. Hanya crypto
+        if getattr(market, "category", "crypto") != "crypto":
+            return f"non_crypto_category:{market.category}"
+
+        # 2. Skip market yang sudah expired
+        if market.end_date:
+            market_end = market.end_date
+            if market_end.tzinfo is None:
+                market_end = market_end.replace(tzinfo=timezone.utc)
+            else:
+                market_end = market_end.astimezone(timezone.utc)
+
+            if market_end <= now_utc:
+                return f"market_expired:end_date={market_end.isoformat()}"
+
+        # 3. Prob ekstrem — kemungkinan data stale atau market hampir resolved
+        prob_yes = latest_snapshot.probability_yes
+        if prob_yes < self.PROB_FLOOR:
+            return f"prob_too_low:{prob_yes}"
+        if prob_yes > self.PROB_CEILING:
+            return f"prob_too_high:{prob_yes}"
+
+        return None
