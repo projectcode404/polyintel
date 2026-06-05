@@ -1,13 +1,12 @@
 """
 collectors/snapshots_collector.py
 
-Fetches live probability, volume, and orderbook data for every tracked
-market and writes immutable rows to `market_snapshots`.
-
 Changelog:
-  v1.3 — fix volume_24h_usd: sebelumnya pakai market.volume_usd (salah).
-          Sekarang pakai market.volume_24h_usd yang benar dari Gamma field
-          volume24hr. market.volume_usd tetap dipakai untuk total volume.
+  v1.4 — handle ClosedMarketSignal dari get_orderbook().
+          Ketika CLOB melaporkan market closed, collector otomatis
+          mark_resolved di DB sehingga market tidak di-snapshot lagi.
+          Sebelumnya: market closed di-skip setiap run → log error spam.
+          Sekarang:   market closed di-mark resolved sekali → hilang dari queue.
 """
 
 from __future__ import annotations
@@ -21,7 +20,12 @@ from utils.db import get_session
 from utils.logger import get_logger
 from repositories.market_repository import MarketRepository
 from repositories.snapshot_repository import SnapshotRepository
-from services.polymarket_service import PolymarketService, PolymarketAPIError, RawOrderbook
+from services.polymarket_service import (
+    PolymarketService,
+    PolymarketAPIError,
+    RawOrderbook,
+    ClosedMarketSignal,
+)
 from services.external_price_service import ExternalPriceService, ExternalPriceContext
 
 log = get_logger(__name__)
@@ -35,6 +39,7 @@ class SnapshotCollectionResult:
     snapshots_written: int = 0
     snapshots_skipped: int = 0
     markets_failed: int = 0
+    markets_closed: int = 0        # market ditandai resolved karena CLOB closed
     markets_processed: int = 0
     external_context_available: bool = False
     duration_seconds: float = 0.0
@@ -47,9 +52,7 @@ class SnapshotCollectionResult:
 
 
 class SnapshotsCollector:
-    """
-    Collects live probability snapshots for all tracked markets.
-    """
+    """Collects live probability snapshots for all tracked markets."""
 
     def __init__(self) -> None:
         self._polymarket = PolymarketService()
@@ -80,11 +83,7 @@ class SnapshotsCollector:
 
             markets_to_process = markets[: settings.snapshot_batch_size]
             if len(markets_to_process) < total:
-                log.warning(
-                    "snapshots_batch_capped",
-                    total=total,
-                    cap=settings.snapshot_batch_size,
-                )
+                log.warning("snapshots_batch_capped", total=total, cap=settings.snapshot_batch_size)
 
             batches = self._chunk(markets_to_process, COMMIT_BATCH_SIZE)
             for batch_num, batch in enumerate(batches, start=1):
@@ -92,6 +91,7 @@ class SnapshotsCollector:
                 result.snapshots_written += batch_result.snapshots_written
                 result.snapshots_skipped += batch_result.snapshots_skipped
                 result.markets_failed += batch_result.markets_failed
+                result.markets_closed += batch_result.markets_closed
                 result.markets_processed += batch_result.markets_processed
 
         except Exception as exc:
@@ -106,6 +106,7 @@ class SnapshotsCollector:
             written=result.snapshots_written,
             skipped=result.snapshots_skipped,
             failed=result.markets_failed,
+            closed_and_resolved=result.markets_closed,
             processed=result.markets_processed,
             success_rate=round(result.success_rate, 3),
             external_context=result.external_context_available,
@@ -115,7 +116,7 @@ class SnapshotsCollector:
         return result
 
     # -------------------------------------------------------------------------
-    # Private — batch processing
+    # Private
     # -------------------------------------------------------------------------
 
     def _load_tracked_markets(self) -> list:
@@ -143,6 +144,7 @@ class SnapshotsCollector:
     ) -> SnapshotCollectionResult:
         result = SnapshotCollectionResult()
 
+        # Fetch semua orderbooks di luar transaksi (HTTP tidak blocking DB)
         condition_ids = [m.condition_id for m in markets]
         orderbooks = self._fetch_orderbooks(condition_ids)
 
@@ -154,6 +156,24 @@ class SnapshotsCollector:
                     result.markets_processed += 1
                     orderbook = orderbooks.get(market.condition_id)
 
+                    # ClosedMarketSignal: market closed di CLOB
+                    # Mark resolved di DB → keluar dari snapshot queue selamanya
+                    if isinstance(orderbook, ClosedMarketSignal):
+                        result.markets_closed += 1
+                        log.info(
+                            "market_auto_resolved_from_clob",
+                            market_id=market.id,
+                            condition_id=market.condition_id,
+                            reason=orderbook.reason,
+                        )
+                        self._market_repo.mark_resolved(
+                            session,
+                            condition_id=market.condition_id,
+                            resolved_at=snapshotted_at,
+                        )
+                        continue
+
+                    # None: API/network error, skip untuk run ini, retry nanti
                     if orderbook is None:
                         result.markets_failed += 1
                         log.warning(
@@ -163,6 +183,7 @@ class SnapshotsCollector:
                         )
                         continue
 
+                    # RawOrderbook: normal, tulis snapshot
                     written = self._write_snapshot(
                         session=session,
                         market=market,
@@ -197,16 +218,19 @@ class SnapshotsCollector:
             written=result.snapshots_written,
             skipped=result.snapshots_skipped,
             failed=result.markets_failed,
+            closed=result.markets_closed,
         )
 
         return result
 
-    def _fetch_orderbooks(self, condition_ids: list[str]) -> dict[str, RawOrderbook | None]:
+    def _fetch_orderbooks(
+        self, condition_ids: list[str]
+    ) -> dict[str, RawOrderbook | ClosedMarketSignal | None]:
         import concurrent.futures
 
-        results: dict[str, RawOrderbook | None] = {}
+        results: dict[str, RawOrderbook | ClosedMarketSignal | None] = {}
 
-        def fetch_single(cid: str) -> tuple[str, RawOrderbook | None]:
+        def fetch_single(cid: str) -> tuple[str, RawOrderbook | ClosedMarketSignal | None]:
             try:
                 return cid, self._polymarket.get_orderbook(cid)
             except Exception as exc:
@@ -230,15 +254,6 @@ class SnapshotsCollector:
         context: ExternalPriceContext,
         snapshotted_at: datetime,
     ) -> bool:
-        """
-        Write one snapshot row.
-        Returns True if written, False if duplicate-guarded.
-
-        FIX v1.3: volume_24h_usd sekarang dari market.volume_24h_usd
-        (bukan market.volume_usd seperti sebelumnya).
-        market.volume_usd = total lifetime volume.
-        market.volume_24h_usd = rolling 24h volume dari Gamma field volume24hr.
-        """
         snapshot = self._snapshot_repo.insert_snapshot(
             session,
             market_id=market.id,
@@ -247,9 +262,8 @@ class SnapshotsCollector:
             best_bid=orderbook.best_bid,
             best_ask=orderbook.best_ask,
             spread=orderbook.spread,
-            # FIX: total lifetime volume
             volume_usd=market.volume_usd,
-            # FIX: rolling 24h volume — sebelumnya salah pakai market.volume_usd
+            # FIX: rolling 24h volume, bukan total lifetime volume
             volume_24h_usd=market.volume_24h_usd,
             liquidity_usd=market.liquidity_usd,
             snapshotted_at=snapshotted_at,
