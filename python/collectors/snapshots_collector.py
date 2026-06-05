@@ -4,35 +4,10 @@ collectors/snapshots_collector.py
 Fetches live probability, volume, and orderbook data for every tracked
 market and writes immutable rows to `market_snapshots`.
 
-Responsibilities:
-  1. Load all active, tracked markets from the DB
-  2. Fetch one orderbook per market from the CLOB API
-  3. Fetch external context (BTC/ETH price, Fear & Greed) once per run
-  4. Write one snapshot row per market (with external context attached)
-  5. Update the denormalized probability cache on the markets table
-
-NOT responsible for:
-  - Fetching market metadata (that is markets_collector.py)
-  - Signal generation or paper trading
-  - Any AI probability estimation
-
-Architecture:
-  SnapshotsCollector depends on:
-    - PolymarketService        (CLOB API calls)
-    - ExternalPriceService     (BTC/ETH price, Fear & Greed)
-    - MarketRepository         (read markets, update cache)
-    - SnapshotRepository       (write snapshots)
-    - get_session()            (transaction management)
-
-Transaction strategy:
-  Unlike the markets collector (which commits per page), the snapshot
-  collector commits in BATCHES of COMMIT_BATCH_SIZE markets. This balances
-  two concerns:
-    - Atomicity: if the run is interrupted, completed batches are preserved
-    - Performance: committing 200 individual transactions is ~5x slower than
-      committing 10 batches of 20
-
-Run cadence: every 5 minutes (configurable via SNAPSHOT_INTERVAL_MINUTES)
+Changelog:
+  v1.3 — fix volume_24h_usd: sebelumnya pakai market.volume_usd (salah).
+          Sekarang pakai market.volume_24h_usd yang benar dari Gamma field
+          volume24hr. market.volume_usd tetap dipakai untuk total volume.
 """
 
 from __future__ import annotations
@@ -51,7 +26,6 @@ from services.external_price_service import ExternalPriceService, ExternalPriceC
 
 log = get_logger(__name__)
 
-# Number of markets to commit per transaction
 COMMIT_BATCH_SIZE = 20
 
 
@@ -59,8 +33,8 @@ COMMIT_BATCH_SIZE = 20
 class SnapshotCollectionResult:
     """Metrics for a single snapshot run."""
     snapshots_written: int = 0
-    snapshots_skipped: int = 0       # duplicate guard triggered
-    markets_failed: int = 0          # CLOB API error or other failure
+    snapshots_skipped: int = 0
+    markets_failed: int = 0
     markets_processed: int = 0
     external_context_available: bool = False
     duration_seconds: float = 0.0
@@ -75,10 +49,6 @@ class SnapshotCollectionResult:
 class SnapshotsCollector:
     """
     Collects live probability snapshots for all tracked markets.
-
-    Usage (called by scheduler every SNAPSHOT_INTERVAL_MINUTES):
-        collector = SnapshotsCollector()
-        result = collector.run()
     """
 
     def __init__(self) -> None:
@@ -88,26 +58,15 @@ class SnapshotsCollector:
         self._snapshot_repo = SnapshotRepository()
 
     def close(self) -> None:
-        """Release HTTP clients. Called on scheduler shutdown."""
         self._polymarket.close()
         self._price_service.close()
 
     def run(self) -> SnapshotCollectionResult:
-        """
-        Execute a full snapshot collection run.
-
-        Steps:
-          1. Load all active tracked markets from DB
-          2. Fetch external price context (once, cached)
-          3. Fetch CLOB orderbooks in batches
-          4. Write snapshots and update market cache
-        """
         log.info("snapshots_collection_start")
         started_at = time.monotonic()
         result = SnapshotCollectionResult()
 
         try:
-            # Step 1: Load markets to snapshot
             markets = self._load_tracked_markets()
             if not markets:
                 log.warning("snapshots_no_tracked_markets")
@@ -116,14 +75,9 @@ class SnapshotsCollector:
             total = len(markets)
             log.info("snapshots_markets_loaded", count=total)
 
-            # Step 2: Fetch external context (BTC price, Fear & Greed)
-            # This is fetched ONCE and attached to every snapshot in this run.
-            # Failures are non-fatal — context fields will be NULL.
             context = self._fetch_external_context()
             result.external_context_available = context.btc_price_usd is not None
 
-            # Step 3 & 4: Process markets in batches
-            # Respect the safety cap from settings
             markets_to_process = markets[: settings.snapshot_batch_size]
             if len(markets_to_process) < total:
                 log.warning(
@@ -165,15 +119,10 @@ class SnapshotsCollector:
     # -------------------------------------------------------------------------
 
     def _load_tracked_markets(self) -> list:
-        """Load all active tracked markets in a read-only session."""
         with get_session() as session:
             return self._market_repo.get_active_tracked(session)
 
     def _fetch_external_context(self) -> ExternalPriceContext:
-        """
-        Fetch external price context. Failures return a null context —
-        snapshot collection continues without external prices.
-        """
         try:
             return self._price_service.get_context()
         except Exception as exc:
@@ -192,27 +141,13 @@ class SnapshotsCollector:
         context: ExternalPriceContext,
         batch_num: int,
     ) -> SnapshotCollectionResult:
-        """
-        Process one batch of markets within a single transaction.
-
-        For each market:
-          1. Fetch its CLOB orderbook (HTTP, outside transaction)
-          2. Write a snapshot row (inside transaction)
-          3. Update markets.market_probability cache (inside transaction)
-
-        The HTTP fetches happen BEFORE the transaction opens so we don't
-        hold the DB connection open during network I/O. All writes happen
-        in one fast transaction at the end.
-        """
         result = SnapshotCollectionResult()
 
-        # Step 1: Fetch all CLOB orderbooks for this batch (outside transaction)
         condition_ids = [m.condition_id for m in markets]
         orderbooks = self._fetch_orderbooks(condition_ids)
 
         snapshotted_at = datetime.now(timezone.utc)
 
-        # Step 2: Write snapshots in one transaction
         try:
             with get_session() as session:
                 for market in markets:
@@ -238,8 +173,6 @@ class SnapshotsCollector:
 
                     if written:
                         result.snapshots_written += 1
-                        # Update denormalized cache on markets table
-                        # Volume/liquidity come from Gamma API (in market table), not CLOB API
                         self._market_repo.update_probability_cache(
                             session,
                             market_id=market.id,
@@ -270,18 +203,16 @@ class SnapshotsCollector:
 
     def _fetch_orderbooks(self, condition_ids: list[str]) -> dict[str, RawOrderbook | None]:
         import concurrent.futures
-        
+
         results: dict[str, RawOrderbook | None] = {}
 
         def fetch_single(cid: str) -> tuple[str, RawOrderbook | None]:
             try:
-                # Menggunakan method get_orderbook (single) dari polymarket_service
                 return cid, self._polymarket.get_orderbook(cid)
             except Exception as exc:
                 log.error("orderbook_fetch_failed", condition_id=cid, error=str(exc))
                 return cid, None
 
-        # Gunakan 15 thread pekerja agar bisa menarik banyak market sekaligus
         max_threads = 15
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
             future_to_cid = {executor.submit(fetch_single, cid): cid for cid in condition_ids}
@@ -290,7 +221,6 @@ class SnapshotsCollector:
                 results[cid] = orderbook
 
         return results
-
 
     def _write_snapshot(
         self,
@@ -304,10 +234,10 @@ class SnapshotsCollector:
         Write one snapshot row.
         Returns True if written, False if duplicate-guarded.
 
-        Spread is computed here: best_ask - best_bid.
-        Redundant (the migration comment says "computed on insert") but
-        we compute it in Python for transparency rather than relying on
-        a DB trigger or generated column.
+        FIX v1.3: volume_24h_usd sekarang dari market.volume_24h_usd
+        (bukan market.volume_usd seperti sebelumnya).
+        market.volume_usd = total lifetime volume.
+        market.volume_24h_usd = rolling 24h volume dari Gamma field volume24hr.
         """
         snapshot = self._snapshot_repo.insert_snapshot(
             session,
@@ -317,8 +247,10 @@ class SnapshotsCollector:
             best_bid=orderbook.best_bid,
             best_ask=orderbook.best_ask,
             spread=orderbook.spread,
+            # FIX: total lifetime volume
             volume_usd=market.volume_usd,
-            volume_24h_usd=market.volume_usd,
+            # FIX: rolling 24h volume — sebelumnya salah pakai market.volume_usd
+            volume_24h_usd=market.volume_24h_usd,
             liquidity_usd=market.liquidity_usd,
             snapshotted_at=snapshotted_at,
             btc_price_usd=context.btc_price_usd,
@@ -331,5 +263,4 @@ class SnapshotsCollector:
 
     @staticmethod
     def _chunk(lst: list, size: int) -> list[list]:
-        """Split a list into chunks of at most `size` elements."""
         return [lst[i : i + size] for i in range(0, len(lst), size)]

@@ -4,8 +4,18 @@ models/market.py
 SQLAlchemy ORM models — mirror exact dari Laravel migrations.
 Python writes, Laravel reads. Semua timestamp UTC.
 
-SPRINT 2 FIX: tambah MarketOutcome yang direferensikan di Market.outcome
-tapi belum ada di Sprint 1.
+Changelog:
+  v1.3 — tambah kolom enrichment dari Gamma API field audit:
+    - volume_24h_usd   : rolling 24h volume dari volume24hr
+    - best_bid         : dari bestBid Gamma response
+    - best_ask         : dari bestAsk Gamma response  
+    - spread           : dari spread Gamma response
+    - price_change_1h  : dari oneHourPriceChange
+    - price_change_1d  : dari oneDayPriceChange
+
+  MIGRATION REQUIRED sebelum deploy:
+    php artisan make:migration add_enrichment_fields_to_markets_table
+    Lihat file migration yang disertakan bersama fix ini.
 """
 
 from __future__ import annotations
@@ -56,11 +66,35 @@ class Market(Base):
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="active", nullable=False)
     market_probability: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+
+    # Volume
     volume_usd: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0, nullable=False)
+    volume_24h_usd: Mapped[Decimal] = mapped_column(
+        Numeric(20, 2), default=0, nullable=False,
+        comment="Rolling 24h volume dari Gamma API field volume24hr"
+    )
     liquidity_usd: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0, nullable=False)
-    num_traders: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Traders — Gamma API tidak expose jumlah trader per market.
+    # num_traders = 0 sampai ada source data yang valid.
+    # Nullable agar bisa dibedakan antara "0 trader" vs "belum diketahui".
+    num_traders: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Orderbook snapshot dari Gamma API
+    # Less real-time dari CLOB (~1-5 min delay) tapi tidak butuh extra API call.
+    # Snapshot table tetap pakai CLOB untuk data real-time.
+    best_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    best_ask: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    spread: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+
+    # Price movement — untuk signal generation dan anomaly detection
+    price_change_1h: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6), nullable=True)
+    price_change_1d: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6), nullable=True)
+
+    # AI fields — diisi oleh AI Engine (Sprint 4)
     ai_probability: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
     edge: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+
     last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     is_tracked: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -87,6 +121,7 @@ class Market(Base):
         Index("markets_edge_idx", "edge"),
         Index("markets_probability_idx", "market_probability"),
         Index("markets_last_synced_idx", "last_synced_at"),
+        Index("markets_volume_24h_idx", "volume_24h_usd"),
     )
 
     def __repr__(self) -> str:
@@ -145,9 +180,6 @@ class MarketSnapshot(Base):
 
 # =============================================================================
 # MarketOutcome
-# Sprint 1 migration: 2024_01_01_000003_create_market_outcomes_table.php
-# Direferensikan di Market.outcome — WAJIB ada di sini.
-# Python collector MENULIS ke tabel ini saat market resolved.
 # =============================================================================
 
 class MarketOutcome(Base):
@@ -157,11 +189,10 @@ class MarketOutcome(Base):
     market_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("markets.id", ondelete="CASCADE"),
-        unique=True,    # Satu market hanya boleh punya satu outcome
+        unique=True,
         nullable=False,
     )
 
-    # Hasil resolusi
     winning_side: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
@@ -173,7 +204,6 @@ class MarketOutcome(Base):
         comment="1.0 = YES resolved, 0.0 = NO resolved",
     )
 
-    # State sebelum resolusi — untuk analisis kalibrasi
     final_probability_before_resolution: Mapped[Optional[Decimal]] = mapped_column(
         Numeric(8, 6), nullable=True
     )
@@ -181,7 +211,6 @@ class MarketOutcome(Base):
     low_probability_yes: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
     total_volume_usd: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0, nullable=False)
 
-    # Source resolusi
     resolved_by: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     resolution_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -193,7 +222,6 @@ class MarketOutcome(Base):
         onupdate=func.now(),
     )
 
-    # Relationship balik ke Market
     market: Mapped["Market"] = relationship(back_populates="outcome")
 
     __table_args__ = (

@@ -17,6 +17,14 @@ Design decisions:
 - Every write happens within a transaction provided by the caller's
   get_session() context manager. This repository never opens its own
   transaction.
+
+Changelog:
+  v1.3 — tambah fields dari RawMarket baru:
+    volume_24h_usd, best_bid, best_ask, spread, price_change_1h,
+    price_change_1d ke upsert_from_api().
+    num_traders tetap di-upsert (= 0) agar kolom DB tidak berubah.
+    Kolom baru di markets table WAJIB ada via migration sebelum deploy.
+    Lihat migration: add_market_enrichment_fields.
 """
 
 from __future__ import annotations
@@ -50,23 +58,22 @@ class MarketRepository:
         Insert a new market or update an existing one by condition_id.
 
         Uses PostgreSQL's ON CONFLICT DO UPDATE (upsert) so this method
-        is safe to call multiple times for the same condition_id — which
-        happens every time the market sync job runs.
+        is safe to call multiple times for the same condition_id.
 
-        Fields that are NEVER overwritten on update:
-          - id (PK)
-          - created_at
-          - ai_probability (owned by AI engine, Sprint 4)
-          - edge (owned by AI engine)
-          - is_tracked (owned by operator configuration)
-          - deleted_at (soft delete, owned by admin)
+        Fields NEVER overwritten on update:
+          - id, created_at
+          - ai_probability, edge  (owned by AI engine, Sprint 4)
+          - is_tracked            (owned by operator config)
+          - deleted_at            (soft delete)
 
-        Fields that ARE updated on every sync:
-          - question, description (Polymarket can edit these)
-          - status (active → resolved)
-          - market_probability, volume_usd, liquidity_usd, num_traders
-          - end_date, resolved_at (set when market closes)
-          - last_synced_at (always now())
+        Fields updated on every sync:
+          - question, description, status
+          - market_probability, volume_usd, volume_24h_usd, liquidity_usd
+          - num_traders (= 0, Gamma API tidak expose field ini)
+          - best_bid, best_ask, spread (dari Gamma response)
+          - price_change_1h, price_change_1d
+          - end_date, resolved_at
+          - last_synced_at, updated_at
           - tags, sub_category
         """
         import json
@@ -88,16 +95,33 @@ class MarketRepository:
             "resolved_at":       self._parse_dt(raw.resolved_at),
             "status":            raw.status,
             "market_probability": raw.market_probability,
+
+            # Volume
             "volume_usd":        raw.volume_usd,
+            "volume_24h_usd":    raw.volume_24h_usd,
             "liquidity_usd":     raw.liquidity_usd,
+
+            # Traders — Gamma API tidak expose jumlah trader.
+            # Field dipertahankan di DB, nilai = 0.
             "num_traders":       raw.num_traders,
+
+            # Orderbook snapshot dari Gamma
+            "best_bid":          raw.best_bid,
+            "best_ask":          raw.best_ask,
+            "spread":            raw.spread,
+
+            # Price movement
+            "price_change_1h":   raw.price_change_1h,
+            "price_change_1d":   raw.price_change_1d,
+
             "is_tracked":        True,
             "last_synced_at":    now,
             "created_at":        now,
             "updated_at":        now,
         }
 
-        # Fields to update on conflict (excludes id, created_at, ai_*, is_tracked, deleted_at)
+        # Fields to update on conflict
+        # Exclude: condition_id (conflict key), created_at, is_tracked, ai_*, deleted_at
         update_values = {
             k: v for k, v in insert_values.items()
             if k not in ("condition_id", "created_at", "is_tracked")
@@ -116,8 +140,7 @@ class MarketRepository:
         result = session.execute(stmt)
         market = result.scalars().first()
 
-        # SQLAlchemy 2.x: after execute(returning), the object is detached.
-        # Re-fetch to get a fully loaded, session-tracked instance.
+        # SQLAlchemy 2.x: after execute(returning), object may be detached.
         if market is None:
             market = session.execute(
                 select(Market).where(Market.condition_id == raw.condition_id)
@@ -128,6 +151,7 @@ class MarketRepository:
             condition_id=raw.condition_id,
             question=raw.question[:60] if raw.question else "",
             status=raw.status,
+            volume_24h=str(raw.volume_24h_usd),
             market_id=market.id if market else None,
         )
 
@@ -168,10 +192,8 @@ class MarketRepository:
                     Market.deleted_at.is_(None),
                 )
                 .order_by(Market.volume_usd.desc())
-                # Limit 500 telah dihapus agar AI bisa mencari edge di semua market
             ).scalars().all()
         )
-
 
     def update_probability_cache(
         self,
@@ -182,13 +204,11 @@ class MarketRepository:
         """
         Update the denormalized probability cache on the markets table.
 
-        This is called by the snapshot collector after each snapshot write.
-        It keeps markets.market_probability current so the dashboard never
-        needs to JOIN market_snapshots for the latest value.
-        
-        NOTE: volume_usd and liquidity_usd are NOT updated here.
-        They come from Gamma API (via MarketsCollector) and are only
-        refreshed during market discovery, not on every price snapshot.
+        Called by snapshot collector after each snapshot write.
+        Keeps markets.market_probability current for dashboard queries.
+
+        NOTE: volume_usd, volume_24h_usd, liquidity_usd, best_bid, best_ask
+        NOT updated here — they come from Gamma API via MarketsCollector.
         """
         session.execute(
             update(Market)
@@ -206,24 +226,21 @@ class MarketRepository:
         condition_id: str,
         resolved_at: datetime,
     ) -> None:
-        """
-        Mark a market as resolved. Called when the Gamma API reports
-        active=false with a resolvedAt timestamp.
-        """
+        """Mark a market as resolved and stop snapshot collection."""
         session.execute(
             update(Market)
             .where(Market.condition_id == condition_id)
             .values(
                 status="resolved",
                 resolved_at=resolved_at,
-                is_tracked=False,   # Stop collecting snapshots for resolved markets
+                is_tracked=False,
                 updated_at=datetime.now(timezone.utc),
             )
         )
         log.info("market_marked_resolved", condition_id=condition_id)
 
     def count_active_tracked(self, session: Session) -> int:
-        """Return the count of active tracked markets. Used for health monitoring."""
+        """Return count of active tracked markets. Used for health monitoring."""
         from sqlalchemy import func
         result = session.execute(
             select(func.count(Market.id)).where(

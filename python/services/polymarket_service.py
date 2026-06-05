@@ -9,6 +9,15 @@ Changelog:
   v1.1 — Sprint 2 fix: httpx.Timeout fix, list response handling
   v1.2 — Sprint 3: keyset pagination (/markets/keyset) untuk fetch semua
           crypto markets tanpa batas offset. Filter crypto only tetap aktif.
+  v1.3 — Sprint 3 fix: field mapping audit.
+          - num_traders: tradesCount/uniqueTraders tidak ada di Gamma API.
+            Ganti ke fallback chain: events[].markets_count → 0 (nullable).
+            Field dipertahankan di RawMarket agar DB schema tidak berubah.
+          - volume_24h_usd: map dari volume24hr (ada di Gamma response).
+          - best_bid, best_ask, spread: sudah tersedia di Gamma response
+            (bestBid, bestAsk, spread). Di-map langsung — mengurangi
+            kebutuhan CLOB call untuk data ini.
+          - Tambah: price_change_1h, price_change_1d untuk analytics.
 
 Dua Polymarket APIs:
   Gamma API  (gamma-api.polymarket.com) — market metadata
@@ -16,6 +25,8 @@ Dua Polymarket APIs:
              /markets/keyset — cursor pagination, unlimited depth
   CLOB API   (clob.polymarket.com)      — live price/probability data
              /markets?condition_id=     — fetch by condition_id
+             NOTE: CLOB tetap dipakai untuk live probability di snapshots.
+             Gamma bid/ask dipakai sebagai fallback/enrichment saja.
 """
 
 from __future__ import annotations
@@ -60,7 +71,29 @@ class PolymarketRateLimitError(PolymarketAPIError):
 
 @dataclass
 class RawMarket:
-    """Normalised market metadata dari Gamma API."""
+    """
+    Normalised market metadata dari Gamma API.
+
+    Field notes (post-audit v1.3):
+      num_traders:
+        Gamma API TIDAK mengembalikan jumlah trader per market.
+        Field tradesCount/uniqueTraders tidak ada di response.
+        num_traders = 0 secara default. Nullable di DB.
+        TODO Sprint 4: isi dari CLOB stats endpoint kalau tersedia.
+
+      volume_24h_usd:
+        Diambil dari field `volume24hr` di Gamma response.
+        Bukan total volume — ini volume rolling 24 jam.
+
+      best_bid, best_ask, spread:
+        Tersedia langsung di Gamma response sebagai bestBid, bestAsk, spread.
+        Lebih stale dibanding CLOB (update Gamma ~1-5 menit) tapi cukup
+        untuk enrichment di markets table. Snapshot tetap pakai CLOB.
+
+      price_change_1h, price_change_1d:
+        Delta probabilitas dalam 1 jam dan 1 hari.
+        Berguna untuk signal generation dan anomaly detection.
+    """
     condition_id: str
     question: str
     slug: str | None
@@ -74,16 +107,32 @@ class RawMarket:
     resolved_at: str | None
     status: str
     market_probability: Decimal | None
+
+    # Volume fields
     volume_usd: Decimal
+    volume_24h_usd: Decimal       # dari volume24hr — rolling 24 jam
     liquidity_usd: Decimal
+
+    # Traders — 0 karena Gamma API tidak expose field ini
     num_traders: int
+
+    # Orderbook snapshot dari Gamma (less real-time than CLOB, tapi gratis)
+    best_bid: Decimal | None
+    best_ask: Decimal | None
+    spread: Decimal | None
+
+    # Price movement
+    price_change_1h: Decimal | None
+    price_change_1d: Decimal | None
+
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass
 class RawOrderbook:
-    """Live price snapshot dari CLOB API.
-    
+    """
+    Live price snapshot dari CLOB API.
+
     NOTE: volume_usd, liquidity_usd come from Gamma API, not CLOB API.
     CLOB API only provides live prices (probability, bid/ask).
     Use market table (from DB) for volume/liquidity data.
@@ -172,7 +221,6 @@ class PolymarketService:
         try:
             yield from self._iter_keyset_pagination()
         except PolymarketAPIError as exc:
-            # Keyset endpoint tidak tersedia — fallback ke offset
             log.warning(
                 "keyset_pagination_unavailable",
                 error=str(exc),
@@ -185,26 +233,6 @@ class PolymarketService:
     # -------------------------------------------------------------------------
 
     def _iter_keyset_pagination(self) -> Iterator[list[RawMarket]]:
-        """
-        Iterasi semua markets via /markets/keyset cursor pagination.
-
-        Gamma API /markets/keyset response:
-          [
-            { ...market data... },
-            { ...market data... },
-          ]
-        Header atau field terakhir mengandung next cursor.
-
-        Polymarket keyset API mengembalikan list markets langsung.
-        Next cursor ada di response header "X-Next-Cursor" atau
-        di field terakhir data sebagai sentinel value.
-
-        Strategi:
-          - Request pertama tanpa cursor
-          - Setiap response, ambil next_cursor dari response body atau header
-          - Berhenti kalau next_cursor kosong atau sama dengan cursor sebelumnya
-          - Berhenti kalau hasil < page_size (halaman terakhir)
-        """
         cursor: str | None = None
         page_num = 0
         total_crypto = 0
@@ -237,7 +265,6 @@ class PolymarketService:
                 )
                 return
 
-            # Filter crypto sebelum parse — hemat CPU dan memory
             crypto_raw = [m for m in response_data if self._is_crypto(m)]
 
             if crypto_raw:
@@ -253,7 +280,6 @@ class PolymarketService:
                     )
                     yield parsed
 
-            # Cek kondisi stop
             if not next_cursor or next_cursor == cursor:
                 log.info(
                     "keyset_pagination_complete",
@@ -279,22 +305,17 @@ class PolymarketService:
 
             if isinstance(data, list):
                 markets_list = data
-                
-                # PERBAIKAN UTAMA: Cari header secara case-insensitive
+
                 next_cursor = None
                 for header_key, header_val in response.headers.items():
                     if header_key.lower() == "x-next-cursor":
                         next_cursor = header_val
                         break
-                        
-                # Fallback kursor jika header benar-benar tidak ada di response API
+
                 if not next_cursor and len(markets_list) > 0:
                     last_item = markets_list[-1]
-                    # Polymarket Keyset biasanya menaruh cursor string di key 'cursor'
-                    next_cursor = last_item.get("cursor")
-                    if not next_cursor:
-                        next_cursor = None
-                        
+                    next_cursor = last_item.get("cursor") or None
+
             elif isinstance(data, dict):
                 markets_list = data.get("data") or data.get("markets") or data.get("results") or []
                 next_cursor = data.get("next_cursor") or data.get("nextCursor") or data.get("cursor")
@@ -314,10 +335,6 @@ class PolymarketService:
     # -------------------------------------------------------------------------
 
     def _iter_offset_pagination(self) -> Iterator[list[RawMarket]]:
-        """
-        Fallback: offset-based pagination di /markets.
-        Berhenti di 422 (offset too large) atau hasil kosong.
-        """
         offset = 0
         page_num = 0
         total_crypto = 0
@@ -338,7 +355,6 @@ class PolymarketService:
                 raw_response = self._fetch_offset_page(params)
             except PolymarketAPIError as exc:
                 if exc.status_code == 422:
-                    # Offset terlalu besar — ini akhir data yang bisa diambil
                     log.info(
                         "offset_pagination_complete",
                         total_pages=page_num - 1,
@@ -348,7 +364,6 @@ class PolymarketService:
                     return
                 raise
 
-            # Normalise response
             if isinstance(raw_response, list):
                 markets_data = raw_response
             elif isinstance(raw_response, dict):
@@ -379,7 +394,6 @@ class PolymarketService:
 
     @retry(exceptions=(httpx.HTTPError, PolymarketRateLimitError))
     def _fetch_offset_page(self, params: dict[str, Any]) -> Any:
-        """Fetch satu page dari /markets dengan offset pagination."""
         url = f"{settings.polymarket_gamma_url}/markets"
         try:
             response = self._client.get(url, params=params)
@@ -411,14 +425,16 @@ class PolymarketService:
             if tokens and isinstance(tokens, list):
                 first_token = tokens[0]
                 if isinstance(first_token, dict):
-                    # FIX: Cek key "token"
-                    first_token_id = first_token.get("token") or first_token.get("token_id") or first_token.get("id")
+                    first_token_id = (
+                        first_token.get("token")
+                        or first_token.get("token_id")
+                        or first_token.get("id")
+                    )
 
             orderbook_data = None
             if first_token_id:
                 url_book = f"{settings.polymarket_clob_url}/book"
                 response_book = self._client.get(url_book, params={"token_id": first_token_id})
-                # FIX: Lempar error jika 429 agar retry berjalan
                 self._raise_for_status(response_book, url_book)
                 if response_book.status_code == 200:
                     orderbook_data = response_book.json()
@@ -426,17 +442,13 @@ class PolymarketService:
             return self._parse_clob_market(condition_id, market_data, orderbook_data)
 
         except httpx.TimeoutException as exc:
-            raise PolymarketAPIError(f"CLOB API timeout", url=url_market) from exc
+            raise PolymarketAPIError("CLOB API timeout", url=url_market) from exc
         except httpx.NetworkError as exc:
-            raise PolymarketAPIError(f"CLOB API network error", url=url_market) from exc
+            raise PolymarketAPIError("CLOB API network error", url=url_market) from exc
 
     def get_orderbooks_batch(
         self, condition_ids: list[str]
     ) -> dict[str, RawOrderbook | None]:
-        """
-        Fetch orderbooks untuk multiple markets secara sequential.
-        Individual failures di-log dan di-skip — tidak abort batch.
-        """
         results: dict[str, RawOrderbook | None] = {}
         for condition_id in condition_ids:
             try:
@@ -472,15 +484,25 @@ class PolymarketService:
         """
         Normalise Gamma API market response ke RawMarket.
 
-        Field mappings:
-          conditionId      → condition_id
-          question         → question
-          slug             → slug
-          active/closed    → status
-          outcomePrices[0] → market_probability
-          volume           → volume_usd
-          liquidity        → liquidity_usd
-          tradesCount      → num_traders
+        Field mappings (verified dari audit_raw_api_responses.py):
+          conditionId         → condition_id
+          question            → question
+          slug                → slug
+          active/closed       → status
+          outcomePrices[0]    → market_probability
+          volume / volumeNum  → volume_usd
+          volume24hr          → volume_24h_usd  ← rolling 24h volume
+          liquidity           → liquidity_usd
+          bestBid             → best_bid        ← dari Gamma langsung
+          bestAsk             → best_ask        ← dari Gamma langsung
+          spread              → spread          ← dari Gamma langsung
+          oneHourPriceChange  → price_change_1h
+          oneDayPriceChange   → price_change_1d
+
+        num_traders NOTE:
+          Field tradesCount dan uniqueTraders TIDAK ADA di Gamma API response.
+          Verified by audit 2026-06-05. num_traders = 0 (default).
+          DB column dipertahankan nullable untuk diisi source lain di masa depan.
         """
         status = self._derive_status(data)
         probability_yes = self._extract_probability_yes(data)
@@ -505,39 +527,51 @@ class PolymarketService:
             resolved_at=data.get("resolvedAt") or data.get("resolved_at"),
             status=status,
             market_probability=probability_yes,
+
+            # Volume — total dan 24h rolling
             volume_usd=self._safe_decimal(
-                data.get("volume") or data.get("volumeNum") or 0
+                data.get("volumeNum") or data.get("volume") or 0
+            ),
+            volume_24h_usd=self._safe_decimal(
+                data.get("volume24hr") or 0
             ),
             liquidity_usd=self._safe_decimal(
-                data.get("liquidity") or data.get("liquidityNum") or 0
+                data.get("liquidityNum") or data.get("liquidity") or 0
             ),
-            num_traders=int(
-                data.get("tradesCount") or data.get("uniqueTraders") or 0
-            ),
+
+            # Traders — Gamma API tidak expose field ini. Default 0.
+            # tradesCount dan uniqueTraders tidak ada di response (verified audit).
+            num_traders=0,
+
+            # Orderbook snapshot dari Gamma response
+            # Lebih stale dari CLOB (~1-5 min delay) tapi tidak perlu extra API call.
+            best_bid=self._safe_decimal_or_none(data.get("bestBid")),
+            best_ask=self._safe_decimal_or_none(data.get("bestAsk")),
+            spread=self._safe_decimal_or_none(data.get("spread")),
+
+            # Price movement — untuk signal generation dan anomaly detection
+            price_change_1h=self._safe_decimal_or_none(data.get("oneHourPriceChange")),
+            price_change_1d=self._safe_decimal_or_none(data.get("oneDayPriceChange")),
+
             raw=data,
         )
 
     def _parse_clob_market(
-        self, condition_id: str, market_data: dict[str, Any], orderbook_data: dict[str, Any] | None = None
+        self,
+        condition_id: str,
+        market_data: dict[str, Any],
+        orderbook_data: dict[str, Any] | None = None,
     ) -> RawOrderbook:
         """
         Normalise CLOB API response ke RawOrderbook.
-        
+
         CLOB API only provides live prices (probability from token price, bid/ask from orderbook).
         Volume/liquidity come from Gamma API (stored in Market table).
-
-        Sources:
-          market_data (dari /markets/{condition_id}):
-            - probability dari tokens[0].price
-          
-          orderbook_data (dari /book?token_id=):
-            - best_bid dari bids[0]
-            - best_ask dari asks[0]
         """
         # Probability dari tokens[0].price
         probability_yes: Decimal | None = None
         tokens = market_data.get("tokens", [])
-        
+
         if tokens and isinstance(tokens, list):
             first_token = tokens[0]
             if isinstance(first_token, dict):
@@ -552,29 +586,26 @@ class PolymarketService:
         if probability_yes is None:
             probability_yes = Decimal("0.5")
 
-        # Clamp [0, 1]
         probability_yes = max(Decimal("0"), min(Decimal("1"), probability_yes))
         probability_no = Decimal("1") - probability_yes
 
-        # Bid/ask dari orderbook_data jika tersedia
+        # Bid/ask dari orderbook_data
         best_bid: Decimal | None = None
         best_ask: Decimal | None = None
 
         if orderbook_data and isinstance(orderbook_data, dict):
             bids = orderbook_data.get("bids", [])
             asks = orderbook_data.get("asks", [])
-            
+
             if bids and isinstance(bids, list):
                 first_bid = bids[0]
-                # Bids might be array of [price, size] or object with price field
                 if isinstance(first_bid, (list, tuple)):
                     best_bid = self._safe_decimal_or_none(first_bid[0])
                 elif isinstance(first_bid, dict):
                     best_bid = self._safe_decimal_or_none(first_bid.get("price"))
-            
+
             if asks and isinstance(asks, list):
                 first_ask = asks[0]
-                # Asks might be array of [price, size] or object with price field
                 if isinstance(first_ask, (list, tuple)):
                     best_ask = self._safe_decimal_or_none(first_ask[0])
                 elif isinstance(first_ask, dict):
@@ -610,9 +641,7 @@ class PolymarketService:
 
     def _raise_for_status(self, response: httpx.Response, url: str) -> None:
         if response.status_code == 429:
-            raise PolymarketRateLimitError(
-                "Rate limited", status_code=429, url=url
-            )
+            raise PolymarketRateLimitError("Rate limited", status_code=429, url=url)
         if response.status_code >= 500:
             raise PolymarketAPIError(
                 f"Server error {response.status_code}",
@@ -627,7 +656,6 @@ class PolymarketService:
             )
 
     def _derive_status(self, data: dict[str, Any]) -> str:
-        """Map Polymarket boolean flags ke status string kita."""
         if data.get("archived", False):
             return "cancelled"
         if data.get("closed", False):
@@ -638,28 +666,20 @@ class PolymarketService:
         return "paused"
 
     def _is_crypto(self, data: dict[str, Any]) -> bool:
-        """
-        True kalau market ini adalah crypto market.
-        Cek 3 sumber: category field, tags, dan kata kunci di question.
-        """
-        # 1. Category field eksplisit
         category = (data.get("category") or "").lower()
         if "crypto" in category:
             return True
 
-        # 2. Tags
         tags = self._extract_tags(data)
         if {t.lower() for t in tags} & self.CRYPTO_TAGS:
             return True
 
-        # 3. Question keywords — fallback untuk market tanpa tags lengkap
         question = (data.get("question") or "").lower()
         return any(kw in question for kw in self.CRYPTO_QUESTION_KEYWORDS)
 
     def _classify_market(
         self, data: dict[str, Any], tags: list[str]
     ) -> tuple[str, str | None]:
-        """Tentukan (category, sub_category) dari tags dan question."""
         tags_lower = {t.lower() for t in tags}
         question = (data.get("question") or "").lower()
 
@@ -681,7 +701,6 @@ class PolymarketService:
         return "crypto", sub_category
 
     def _extract_tags(self, data: dict[str, Any]) -> list[str]:
-        """Parse tags dari berbagai format response Polymarket."""
         raw_tags = data.get("tags", [])
         if isinstance(raw_tags, str):
             try:
@@ -707,13 +726,6 @@ class PolymarketService:
         return []
 
     def _extract_probability_yes(self, data: dict[str, Any]) -> Decimal | None:
-        """
-        Extract YES token price dari outcomePrices.
-        Format yang mungkin:
-          '["0.63", "0.37"]'  — JSON string
-          ["0.63", "0.37"]    — list of strings
-          [0.63, 0.37]        — list of floats
-        """
         outcome_prices = data.get("outcomePrices")
         if outcome_prices is None:
             return None
@@ -732,7 +744,6 @@ class PolymarketService:
 
     @staticmethod
     def _safe_decimal(value: Any) -> Decimal:
-        """Convert ke Decimal, return 0 kalau gagal."""
         try:
             if value is None:
                 return Decimal("0")
@@ -742,10 +753,10 @@ class PolymarketService:
 
     @staticmethod
     def _safe_decimal_or_none(value: Any) -> Decimal | None:
-        """Convert ke Decimal, return None kalau gagal."""
         if value is None:
             return None
         try:
-            return Decimal(str(value))
+            d = Decimal(str(value))
+            return d
         except (InvalidOperation, Exception):
             return None
