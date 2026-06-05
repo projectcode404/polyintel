@@ -136,10 +136,19 @@ class PolymarketService:
         "ripple", "dogecoin", "doge", "shib", "pepe",
     })
 
+    # IMPORTANT: keywords pakai spasi atau prefix $ untuk avoid substring match.
+    # Contoh bug: "eth" match "Gaethje", "defi" match "trade deficit", "token" match apapun.
+    # Semua entry di sini harus spesifik dan tidak ambigu.
     CRYPTO_QUESTION_KEYWORDS = frozenset({
-        "btc", "eth", "bitcoin", "ethereum", "crypto", "solana",
-        "sol", "bnb", "xrp", "doge", "usdc", "usdt", "defi",
-        "altcoin", "blockchain", "nft", "web3", "token",
+        "bitcoin", "ethereum",
+        " btc ", "$btc", "btc ", "btc$",
+        " eth ", "$eth", "eth ", "eth$",
+        " sol ", "$sol", "solana",
+        " bnb ", "$bnb",
+        " xrp ", "$xrp",
+        " doge ", "$doge", "dogecoin",
+        " usdc", " usdt",
+        "cryptocurrency", " crypto ",
     })
 
     def __init__(self) -> None:
@@ -166,22 +175,35 @@ class PolymarketService:
     # Gamma API — market metadata
     # =========================================================================
 
-    def iter_active_crypto_markets(self) -> Iterator[list[RawMarket]]:
-        log.info("gamma_pagination_start", mode="keyset")
-        try:
-            yield from self._iter_keyset_pagination()
-        except PolymarketAPIError as exc:
-            log.warning(
-                "keyset_pagination_unavailable",
-                error=str(exc),
-                fallback="offset_pagination",
-            )
-            yield from self._iter_offset_pagination()
+    def iter_active_crypto_markets(self, full_scan: bool = False) -> Iterator[list[RawMarket]]:
+        """
+        Iterate active crypto markets from Gamma API.
+
+        Gamma keyset pagination is broken — cursor repeats after page 1,
+        returning identical data. Offset pagination works correctly.
+
+        full_scan=False (default, incremental):
+            Fetch only first 500 markets by volume (offsets 0-499).
+            Used for hourly sync — captures all high-volume markets.
+            Runtime: ~2s.
+
+        full_scan=True (daily):
+            Fetch all ~10,000+ active markets across all offsets.
+            Used for daily sync — discovers new/low-volume crypto markets.
+            Runtime: ~35s.
+        """
+        log.info("gamma_pagination_start", mode="offset", full_scan=full_scan)
+        yield from self._iter_offset_pagination(full_scan=full_scan)
+
+    # Stop fetching pages when all markets on a page are below this volume.
+    # Markets with < $500 volume have no meaningful liquidity for paper trading.
+    MIN_PAGE_VOLUME_USD = 500.0
 
     def _iter_keyset_pagination(self) -> Iterator[list[RawMarket]]:
         cursor: str | None = None
         page_num = 0
         total_crypto = 0
+        seen_cursors: set[str] = set()
 
         while True:
             page_num += 1
@@ -192,14 +214,31 @@ class PolymarketService:
                 "ascending": "false",
             }
             if cursor:
-                params["next_cursor"] = cursor
+                params["cursor"] = cursor
 
             log.debug("keyset_page_request", page=page_num, cursor=cursor[:20] if cursor else None)
 
             response_data, next_cursor = self._fetch_keyset_page(params)
 
             if not response_data:
-                log.info("keyset_pagination_complete", total_pages=page_num - 1, total_crypto=total_crypto)
+                log.info("keyset_pagination_complete", total_pages=page_num - 1, total_crypto=total_crypto, reason="empty_page")
+                return
+
+            # Stop when all markets on page are below volume threshold.
+            # Markets are ordered by volume desc — once a full page is low-volume,
+            # all subsequent pages will be too.
+            page_max_volume = max(
+                float(m.get("volumeNum") or m.get("volume") or 0)
+                for m in response_data
+            )
+            if page_max_volume < self.MIN_PAGE_VOLUME_USD:
+                log.info(
+                    "keyset_pagination_complete",
+                    total_pages=page_num,
+                    total_crypto=total_crypto,
+                    reason="below_volume_threshold",
+                    page_max_volume=page_max_volume,
+                )
                 return
 
             crypto_raw = [m for m in response_data if self._is_crypto(m)]
@@ -216,9 +255,20 @@ class PolymarketService:
                     )
                     yield parsed
 
-            if not next_cursor or next_cursor == cursor:
+            if not next_cursor:
                 log.info("keyset_pagination_complete", total_pages=page_num, total_crypto=total_crypto, reason="no_next_cursor")
                 return
+
+            # Safety: detect cursor loop (API bug / wrap-around)
+            if next_cursor in seen_cursors:
+                log.warning(
+                    "keyset_cursor_loop_detected",
+                    total_pages=page_num,
+                    total_crypto=total_crypto,
+                    cursor=next_cursor[:20],
+                )
+                return
+            seen_cursors.add(next_cursor)
 
             cursor = next_cursor
 
@@ -255,16 +305,32 @@ class PolymarketService:
         except httpx.NetworkError as exc:
             raise PolymarketAPIError(f"Keyset API network error: {exc}", url=url) from exc
 
-    def _iter_offset_pagination(self) -> Iterator[list[RawMarket]]:
+    # Incremental sync: only fetch top N markets by volume.
+    # Covers all markets with meaningful liquidity without full scan overhead.
+    INCREMENTAL_OFFSET_LIMIT = 500
+
+    def _iter_offset_pagination(self, full_scan: bool = False) -> Iterator[list[RawMarket]]:
         offset = 0
         page_num = 0
         total_crypto = 0
+        offset_limit = None if full_scan else self.INCREMENTAL_OFFSET_LIMIT
 
         while True:
+            # Incremental mode: stop after INCREMENTAL_OFFSET_LIMIT markets
+            if offset_limit is not None and offset >= offset_limit:
+                log.info(
+                    "offset_pagination_complete",
+                    total_pages=page_num,
+                    total_crypto=total_crypto,
+                    reason="incremental_limit_reached",
+                    offset=offset,
+                )
+                return
+
             page_num += 1
             params = {
                 "active": "true",
-                "limit": settings.gamma_page_size,
+                "limit": 100,  # Gamma API max limit is 100
                 "offset": offset,
                 "order": "volume",
                 "ascending": "false",
@@ -282,7 +348,7 @@ class PolymarketService:
             if isinstance(raw_response, list):
                 markets_data = raw_response
             elif isinstance(raw_response, dict):
-                markets_data = raw_response.get("data") or raw_response.get("results") or []
+                markets_data = raw_response.get("markets") or raw_response.get("data") or raw_response.get("results") or []
             else:
                 return
 
@@ -297,11 +363,11 @@ class PolymarketService:
                     total_crypto += len(parsed)
                     yield parsed
 
-            if len(markets_data) < settings.gamma_page_size:
+            if len(markets_data) < 100:  # Gamma API max limit is 100
                 log.info("offset_pagination_complete", total_pages=page_num, total_crypto=total_crypto)
                 return
 
-            offset += settings.gamma_page_size
+            offset += 100  # Gamma API max limit is 100
 
     @retry(exceptions=(httpx.HTTPError, PolymarketRateLimitError))
     def _fetch_offset_page(self, params: dict[str, Any]) -> Any:

@@ -79,23 +79,29 @@ class MarketsCollector:
         """Release the HTTP client. Called on scheduler shutdown."""
         self._service.close()
 
-    def run(self) -> MarketCollectionResult:
+    def run(self, full_scan: bool = False) -> MarketCollectionResult:
         """
-        Execute a full market sync run.
+        Execute a market sync run.
 
-        Pages through the Gamma API and upserts all active crypto markets.
+        full_scan=False (default, incremental):
+            Fetches top 500 markets by volume. Used for frequent syncs.
+            Captures all high-liquidity crypto markets. Runtime ~1-2s.
+
+        full_scan=True (daily):
+            Fetches all ~10,000 active markets. Discovers new/low-volume
+            crypto markets. Runtime ~15-35s. Run once per day at midnight.
+
         Each page is committed in its own transaction — if a later page
-        fails, earlier pages are already persisted. This prevents the
-        entire run from being rolled back due to a single bad page.
+        fails, earlier pages are already persisted.
 
         Returns a MarketCollectionResult with counts for monitoring.
         """
-        log.info("markets_collection_start")
+        log.info("markets_collection_start", full_scan=full_scan)
         started_at = time.monotonic()
         result = MarketCollectionResult()
 
         try:
-            for page in self._service.iter_active_crypto_markets():
+            for page in self._service.iter_active_crypto_markets(full_scan=full_scan):
                 result.pages_fetched += 1
                 page_result = self._process_page(page)
 

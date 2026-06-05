@@ -157,6 +157,24 @@ def job_collect_markets() -> None:
         raise
 
 
+def job_collect_markets_full() -> None:
+    """Full market scan — fetch all ~10,000 active markets. Daily at 00:00 UTC.
+    Discovers new and low-volume crypto markets missed by incremental sync."""
+    log.info("job_collect_markets_full_start")
+    try:
+        result = _markets_collector.run(full_scan=True)
+        log.info(
+            "job_collect_markets_full_done",
+            inserted=result.inserted,
+            updated=result.updated,
+            errors=result.errors,
+            duration=round(result.duration_seconds, 2),
+        )
+    except Exception as exc:
+        log.exception("job_collect_markets_full_failed", error=str(exc))
+        raise
+
+
 def job_collect_snapshots() -> None:
     """Collect CLOB probability snapshots. Every SNAPSHOT_INTERVAL_MINUTES."""
     log.info("job_collect_snapshots_start")
@@ -342,6 +360,17 @@ def main() -> None:
         id="collect_markets",
         name="Market Sync (Gamma API)",
         next_run_time=now,
+    )
+
+    # Daily full scan: every day at 00:00 UTC
+    # Discovers new/low-volume crypto markets missed by incremental sync
+    _scheduler.add_job(
+        job_collect_markets_full,
+        trigger="cron",
+        hour=0,
+        minute=0,
+        id="collect_markets_full",
+        name="Market Full Scan (Daily)",
     )
 
     # All other jobs: delayed 90s — secondary safety net after cold start sync
