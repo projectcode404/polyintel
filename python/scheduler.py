@@ -3,33 +3,38 @@ scheduler.py
 
 Process entry point. Configures and runs the APScheduler job loop.
 
-Two jobs run on independent schedules:
-  collect_markets   — every MARKET_SYNC_INTERVAL_MINUTES (default: 60)
+Jobs and schedules:
+  collect_markets   — every MARKET_SYNC_INTERVAL_MINUTES (default: 15)
   collect_snapshots — every SNAPSHOT_INTERVAL_MINUTES    (default:  5)
+  collect_stats     — every 60 minutes
+  collect_signals   — every SNAPSHOT_INTERVAL_MINUTES    (default:  5)
+  evaluate_signals  — every SNAPSHOT_INTERVAL_MINUTES    (default:  5) [Sprint 3]
 
 Design decisions:
-- BackgroundScheduler runs jobs in a thread pool (max_workers=2).
-  Jobs do not share state — MarketsCollector and SnapshotsCollector are
-  separate instances with separate HTTP clients.
-- misfire_grace_time=60: if a job is still running when its next fire time
-  arrives, APScheduler waits up to 60 seconds before declaring a misfire.
-  For the 5-minute snapshot job, this means we tolerate runs up to 5m 60s.
-- coalesce=True: if a job is misfired more than once (e.g. process was
-  paused), only one catch-up run fires on resume — not N catch-up runs.
-- Jobs run IMMEDIATELY at startup (next_run_time=now) so we don't wait
-  60 minutes for the first market sync after a deploy.
-- Signal handlers (SIGTERM / SIGINT) shut down the scheduler gracefully:
-  in-flight jobs complete, HTTP clients are closed, then the process exits.
-- Startup performs a DB connectivity check. If the DB is unavailable,
-  the process exits immediately with a clear error rather than starting
-  a scheduler that will fail every 5 minutes.
+  - BackgroundScheduler runs jobs in a thread pool (max_workers=4).
+  - misfire_grace_time=60: tolerate up to 60s latency before misfire.
+  - coalesce=True: one catch-up run on resume, not N.
+  - collect_markets fires IMMEDIATELY at startup (next_run_time=now).
+  - All other jobs delayed by startup_delay (90s) so collect_markets
+    has time to populate the DB before snapshots/signals run.
+  - Cold start sync: collect_markets also runs SYNCHRONOUSLY before the
+    scheduler starts. The 90s delay is a safety net; the sync is the
+    guarantee. If sync takes >90s (slow API), snapshot still won't see
+    an empty DB.
+  - Signal handlers (SIGTERM/SIGINT) shut down gracefully.
+  - DB connectivity check at startup — fail fast if DB unreachable.
 
-Environment variable summary (all in config/settings.py):
+Sprint 3 additions:
+  - _signal_evaluator singleton (SignalEvaluator)
+  - job_evaluate_signals: evaluates pending signals against resolved
+    market outcomes. Runs on same interval as snapshots.
+    Delayed 90s + 30s extra so snapshot job completes its first run first.
+
+Environment variables (all in config/settings.py):
   SNAPSHOT_INTERVAL_MINUTES    default: 5
-  MARKET_SYNC_INTERVAL_MINUTES default: 60
+  MARKET_SYNC_INTERVAL_MINUTES default: 15
   LOG_LEVEL                    default: INFO
-  LOG_FORMAT                   default: console  (json in prod)
-  DB_HOST / DB_PORT / etc.
+  LOG_FORMAT                   default: json (prod) | console (dev)
 """
 
 from __future__ import annotations
@@ -52,41 +57,91 @@ log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Job functions — thin wrappers that instantiate collectors and call .run()
-# Collectors are instantiated fresh per-run to avoid stale state.
-# The HTTP client inside PolymarketService is re-used via connection pooling.
+# Collector singletons
+# Reusing instances preserves TCP connections across runs (httpx Client).
 # ---------------------------------------------------------------------------
 
-_markets_collector = None
+_markets_collector   = None
 _snapshots_collector = None
-_stats_collector = None
-_signals_collector = None
+_stats_collector     = None
+_signals_collector   = None
+_signal_evaluator    = None    # Sprint 3
 
 
 def _init_collectors() -> None:
-    """
-    Initialise collector singletons at startup.
-    Reusing instances preserves TCP connections across runs (httpx Client).
-    """
-    global _markets_collector, _snapshots_collector, _stats_collector, _signals_collector
+    global _markets_collector, _snapshots_collector
+    global _stats_collector, _signals_collector, _signal_evaluator
 
-    from collectors.markets_collector import MarketsCollector
+    from collectors.markets_collector   import MarketsCollector
     from collectors.snapshots_collector import SnapshotsCollector
-    from collectors.stats_collector import StatsCollector
-    from collectors.signal_collector import SignalCollector
+    from collectors.stats_collector     import StatsCollector
+    from collectors.signal_collector    import SignalCollector
+    from services.signal_evaluator      import SignalEvaluator    # Sprint 3
 
-    _markets_collector = MarketsCollector()
+    _markets_collector   = MarketsCollector()
     _snapshots_collector = SnapshotsCollector()
-    _stats_collector = StatsCollector()
-    _signals_collector = SignalCollector()
+    _stats_collector     = StatsCollector()
+    _signals_collector   = SignalCollector()
+    _signal_evaluator    = SignalEvaluator()
+
     log.info("collectors_initialised")
 
 
+# ---------------------------------------------------------------------------
+# Cold start sync
+# ---------------------------------------------------------------------------
+
+def _cold_start_market_sync() -> None:
+    """
+    Run market sync SYNCHRONOUSLY before scheduler starts.
+
+    WHY:
+      The 90s startup_delay is a best-effort buffer. If collect_markets
+      takes >90s (slow API, large dataset, cold network), snapshot and
+      signal collectors will still find an empty DB on their first run.
+
+      This sync guarantees markets are in the DB BEFORE the scheduler
+      starts, regardless of how long the API takes.
+
+    TRADEOFF:
+      Process startup is slower by ~30-60s (typical market sync time).
+      This is acceptable — correct first run > fast startup.
+
+    ERROR HANDLING:
+      Non-fatal. If sync fails, scheduler starts anyway.
+      collect_markets will retry on its first scheduled interval.
+      Log clearly so ops can see the cold start failed.
+    """
+    log.info("cold_start_market_sync_begin")
+    try:
+        result = _markets_collector.run()
+        log.info(
+            "cold_start_market_sync_done",
+            inserted=result.inserted,
+            updated=result.updated,
+            errors=result.errors,
+            duration=round(result.duration_seconds, 2),
+        )
+        if result.inserted == 0 and result.updated == 0:
+            log.warning(
+                "cold_start_market_sync_empty",
+                hint="API may be unreachable or returned no crypto markets. "
+                     "Snapshot collector will retry on first scheduled run.",
+            )
+    except Exception as exc:
+        log.error(
+            "cold_start_market_sync_failed",
+            error=str(exc),
+            hint="Scheduler will start. First snapshot run may find 0 markets.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Job functions — thin wrappers, business logic stays in collectors/services
+# ---------------------------------------------------------------------------
+
 def job_collect_markets() -> None:
-    """
-    APScheduler job: synchronise markets from Polymarket Gamma API.
-    Runs every MARKET_SYNC_INTERVAL_MINUTES.
-    """
+    """Sync markets from Polymarket Gamma API. Every MARKET_SYNC_INTERVAL_MINUTES."""
     log.info("job_collect_markets_start")
     try:
         result = _markets_collector.run()
@@ -98,16 +153,12 @@ def job_collect_markets() -> None:
             duration=round(result.duration_seconds, 2),
         )
     except Exception as exc:
-        # APScheduler catches this too, but we log it here for context
         log.exception("job_collect_markets_failed", error=str(exc))
-        raise  # Let APScheduler record the job error event
+        raise
 
 
 def job_collect_snapshots() -> None:
-    """
-    APScheduler job: collect probability snapshots for tracked markets.
-    Runs every SNAPSHOT_INTERVAL_MINUTES.
-    """
+    """Collect CLOB probability snapshots. Every SNAPSHOT_INTERVAL_MINUTES."""
     log.info("job_collect_snapshots_start")
     try:
         result = _snapshots_collector.run()
@@ -124,10 +175,7 @@ def job_collect_snapshots() -> None:
 
 
 def job_collect_stats() -> None:
-    """
-    APScheduler job: compute daily stats (7d volume, 24h momentum).
-    Runs every hour to keep stats reasonably fresh without heavy load.
-    """
+    """Precompute daily stats (7d volume, 24h momentum). Every 60 minutes."""
     log.info("job_collect_stats_start")
     try:
         _stats_collector.run()
@@ -138,10 +186,7 @@ def job_collect_stats() -> None:
 
 
 def job_collect_signals() -> None:
-    """
-    APScheduler job: evaluate rules and generate signals.
-    Runs every SNAPSHOT_INTERVAL_MINUTES.
-    """
+    """Evaluate rules and generate signals. Every SNAPSHOT_INTERVAL_MINUTES."""
     log.info("job_collect_signals_start")
     try:
         _signals_collector.run()
@@ -151,8 +196,33 @@ def job_collect_signals() -> None:
         raise
 
 
+def job_evaluate_signals() -> None:
+    """
+    Sprint 3 — Evaluate pending signals against resolved market outcomes.
+
+    Runs on same interval as snapshots. Fast no-op when nothing to evaluate.
+    Delayed an extra 30s beyond startup_delay so snapshot job completes
+    its first run before evaluator checks for newly resolved markets.
+    """
+    log.info("job_evaluate_signals_start")
+    try:
+        result = _signal_evaluator.run()
+        log.info(
+            "job_evaluate_signals_done",
+            evaluated=result.evaluated,
+            correct=result.correct,
+            incorrect=result.incorrect,
+            cancelled=result.cancelled,
+            win_rate=round(result.win_rate, 4),
+            duration=round(result.duration_seconds, 2),
+        )
+    except Exception as exc:
+        log.exception("job_evaluate_signals_failed", error=str(exc))
+        raise
+
+
 # ---------------------------------------------------------------------------
-# APScheduler event listener — structured logging for all job lifecycle events
+# APScheduler event listener
 # ---------------------------------------------------------------------------
 
 def _on_job_event(event: JobExecutionEvent) -> None:
@@ -171,10 +241,6 @@ def _on_job_event(event: JobExecutionEvent) -> None:
 # ---------------------------------------------------------------------------
 
 def _check_db_connectivity() -> None:
-    """
-    Verify we can reach PostgreSQL before starting the scheduler.
-    Exits the process on failure with a clear error message.
-    """
     from utils.db import get_session
     from sqlalchemy import text
 
@@ -200,10 +266,6 @@ _scheduler: BackgroundScheduler | None = None
 
 
 def _shutdown(signum: int, frame) -> None:
-    """
-    Handle SIGTERM / SIGINT gracefully.
-    Waits for in-flight jobs to complete before exiting.
-    """
     sig_name = signal.Signals(signum).name
     log.info("shutdown_signal_received", signal=sig_name)
 
@@ -245,18 +307,19 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    # 4. Configure APScheduler
+    # 4. Cold start: sync markets synchronously before scheduler starts.
+    #    Guarantees DB is populated even if API is slow (>90s).
+    #    The startup_delay below is a secondary safety net.
+    _cold_start_market_sync()
+
+    # 5. Configure APScheduler
     executors = {
-        # Two threads: one for markets job, one for snapshots job.
-        # They never run concurrently (different schedules) but the pool
-        # allows both to be scheduled without blocking each other.
         "default": ThreadPoolExecutor(max_workers=4),
     }
-
     job_defaults = {
-        "coalesce": True,          # Run once on catch-up, not N times
-        "max_instances": 1,        # Never run the same job concurrently
-        "misfire_grace_time": 60,  # Tolerate up to 60s of latency
+        "coalesce": True,
+        "max_instances": 1,
+        "misfire_grace_time": 60,
     }
 
     _scheduler = BackgroundScheduler(
@@ -264,17 +327,14 @@ def main() -> None:
         job_defaults=job_defaults,
         timezone="UTC",
     )
-
-    # Listen to job events for structured logging
     _scheduler.add_listener(_on_job_event, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
 
-    # 5. Register jobs
-    # run_date=None + next_run_time override fires immediately at startup
+    # 6. Register jobs
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-
     now = _dt.now(_tz.utc)
-    startup_delay = _td(seconds=90)   # buffer: markets collector ~30-60s
 
+    # collect_markets: fires immediately (cold start already ran, but
+    # schedule normally so it stays on its interval from startup time)
     _scheduler.add_job(
         job_collect_markets,
         trigger="interval",
@@ -284,14 +344,8 @@ def main() -> None:
         next_run_time=now,
     )
 
-    _scheduler.add_job(
-        job_collect_stats,
-        trigger="interval",
-        minutes=60,
-        id="collect_stats",
-        name="Daily Stats Precomputation",
-        next_run_time=now + startup_delay,
-    )
+    # All other jobs: delayed 90s — secondary safety net after cold start sync
+    startup_delay = _td(seconds=90)
 
     _scheduler.add_job(
         job_collect_snapshots,
@@ -311,8 +365,27 @@ def main() -> None:
         next_run_time=now + startup_delay,
     )
 
+    _scheduler.add_job(
+        job_collect_stats,
+        trigger="interval",
+        minutes=60,
+        id="collect_stats",
+        name="Daily Stats Precomputation",
+        next_run_time=now + startup_delay,
+    )
 
-    # 6. Start
+    # Sprint 3 — evaluate_signals: extra 30s delay so snapshot job
+    # completes its first run before evaluator checks for outcomes
+    _scheduler.add_job(
+        job_evaluate_signals,
+        trigger="interval",
+        minutes=settings.snapshot_interval_minutes,
+        id="evaluate_signals",
+        name="Signal Evaluation (Sprint 3)",
+        next_run_time=now + startup_delay + _td(seconds=30),
+    )
+
+    # 7. Start
     _scheduler.start()
 
     log.info(
@@ -320,11 +393,10 @@ def main() -> None:
         jobs=[job.id for job in _scheduler.get_jobs()],
     )
 
-    # 7. Block the main thread — APScheduler runs in background threads
+    # 8. Block main thread — APScheduler runs in background threads
     try:
         while True:
             time.sleep(60)
-            # Log a heartbeat every minute so ops can see the process is alive
             log.debug(
                 "scheduler_heartbeat",
                 running_jobs=[j.id for j in _scheduler.get_jobs()],
