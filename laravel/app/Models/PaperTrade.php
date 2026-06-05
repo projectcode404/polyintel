@@ -25,6 +25,7 @@ final class PaperTrade extends Model
     use SoftDeletes;
 
     protected $fillable = [
+        'trading_account_id',   // ← TAMBAH INI
         'market_id',
         'signal_id',
         'direction',
@@ -73,6 +74,11 @@ final class PaperTrade extends Model
     // =========================================================================
     // Relationships
     // =========================================================================
+
+    public function tradingAccount(): BelongsTo  // ← TAMBAH INI
+    {
+        return $this->belongsTo(TradingAccount::class);
+    }
 
     public function market(): BelongsTo
     {
@@ -124,34 +130,23 @@ final class PaperTrade extends Model
 
     public function getRoiPercentAttribute(): string
     {
-        if ($this->roi === null) {
-            return 'Open';
-        }
-
+        if ($this->roi === null) return 'Open';
         $sign = $this->roi >= 0 ? '+' : '';
         return $sign . number_format($this->roi * 100, 2) . '%';
     }
 
     public function getPnlFormattedAttribute(): string
     {
-        if ($this->pnl_usd === null) {
-            return 'Open';
-        }
-
+        if ($this->pnl_usd === null) return 'Open';
         $sign = $this->pnl_usd >= 0 ? '+$' : '-$';
         return $sign . number_format(abs($this->pnl_usd), 2);
     }
 
-    /**
-     * Verify PnL calculation integrity.
-     * Used in tests and the service layer before saving.
-     */
     public function verifyPnlIntegrity(): bool
     {
         if ($this->exit_price === null || $this->pnl_usd === null) {
-            return true; // Open trade — nothing to verify yet
+            return true;
         }
-
         $expectedPnl = ($this->exit_price - $this->entry_price) * $this->shares - $this->fees_usd;
         $expectedRoi = $this->position_size_usd > 0
             ? $expectedPnl / $this->position_size_usd

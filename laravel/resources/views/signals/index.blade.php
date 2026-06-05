@@ -164,20 +164,16 @@ document.addEventListener('DOMContentLoaded', function () {
             cellStyle: { color: '#6c757d', fontSize: '11px' }
         },
         {
-            // FIX: gunakan signal ID untuk lookup ke snapshotStore
             headerName: 'Context',
-            field: 'id',
-            width: 90,
+            field: 'market_id',
+            width: 100,
             filter: false,
             sortable: false,
             cellRenderer: params => {
-                const hasData = snapshotStore.has(params.value);
-                if (!hasData) return '<span class="text-muted">—</span>';
-                return `<button 
-                    class="btn btn-sm btn-outline-secondary py-0 px-2" 
-                    style="font-size:11px;"
-                    onclick="showContext(${params.value})"
-                >JSON</button>`;
+                if (!params.value) return '<span class="text-muted">—</span>';
+                return `<a href="/markets/${params.value}" 
+                        class="btn btn-sm btn-outline-secondary py-0 px-2" 
+                        style="font-size:11px;">Market</a>`;
             }
         },
         {

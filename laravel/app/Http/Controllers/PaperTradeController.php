@@ -22,10 +22,6 @@ class PaperTradeController extends Controller
     {
         $account = $portfolioService->getAccountForUser(Auth::user());
 
-        if (!$account) {
-            return response()->json(['rows' => [], 'totalRows' => 0]);
-        }
-
         $query = PaperTrade::with(['market', 'signal'])
                            ->where('trading_account_id', $account->id);
 
@@ -35,7 +31,10 @@ class PaperTradeController extends Controller
         }
 
         // Sorting
-        $allowedSort = ['entry_price', 'shares', 'position_size_usd', 'pnl_usd', 'roi', 'status', 'entered_at', 'direction'];
+        $allowedSort = [
+            'entry_price', 'shares', 'position_size_usd',
+            'pnl_usd', 'roi', 'status', 'entered_at', 'direction',
+        ];
 
         if ($request->filled('sortModel')) {
             $sortModel = json_decode($request->input('sortModel'), true) ?? [];
@@ -48,12 +47,10 @@ class PaperTradeController extends Controller
             $query->latest('entered_at');
         }
 
-        // Pagination
         $startRow  = (int) $request->input('startRow', 0);
         $endRow    = (int) $request->input('endRow', 100);
         $limit     = max(1, $endRow - $startRow);
-
-        $totalRows = $query->count();
+        $totalRows = (clone $query)->count();
         $trades    = $query->offset($startRow)->limit($limit)->get();
 
         $rows = $trades->map(function ($trade) {
@@ -66,12 +63,18 @@ class PaperTradeController extends Controller
                 'trigger_source'        => $trade->signal->trigger_source ?? null,
                 'direction'             => $trade->direction,
                 'entry_price'           => $trade->entry_price,
-                'current_price'         => $isOpen ? ($trade->current_price ?? $trade->entry_price) : null,
-                'current_or_exit_price' => $isOpen ? ($trade->current_price ?? $trade->entry_price) : $trade->exit_price,
+                'current_price'         => $isOpen
+                    ? ($trade->current_price ?? $trade->entry_price)
+                    : null,
+                'current_or_exit_price' => $isOpen
+                    ? ($trade->current_price ?? $trade->entry_price)
+                    : $trade->exit_price,
                 'exit_price'            => $trade->exit_price,
                 'shares'                => $trade->shares,
                 'position_size_usd'     => $trade->position_size_usd,
-                'unrealized_pnl_usd'    => $isOpen ? $trade->unrealized_pnl_usd : null,
+                'unrealized_pnl_usd'    => $isOpen
+                    ? ($trade->unrealized_pnl_usd ?? 0.0)
+                    : null,
                 'pnl_usd'               => $trade->pnl_usd,
                 'roi'                   => $trade->roi,
                 'status'                => $trade->status,
@@ -92,8 +95,16 @@ class PaperTradeController extends Controller
             'exit_price' => 'required|numeric|min:0|max:1',
         ]);
 
-        if ($trade->tradingAccount->user_id !== Auth::id()) {
-            abort(403);
+        // FIX: gunakan trading_account_id bukan relasi tradingAccount->user_id
+        // karena sebelumnya relasi tidak ada di model
+        $account = $trade->tradingAccount;
+
+        if (!$account || $account->user_id !== Auth::id()) {
+            abort(403, 'Unauthorized');
+        }
+
+        if ($trade->status !== 'open') {
+            return back()->with('error', 'Trade is already closed.');
         }
 
         try {

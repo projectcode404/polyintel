@@ -91,7 +91,6 @@ class SignalController extends Controller
                 'edge_at_signal' => $sig->edge_at_signal,
                 'status' => $sig->status,
                 'fired_at' => $sig->fired_at?->format('Y-m-d H:i:s'),
-                'snapshot_data' => $sig->snapshot_data,
             ];
         });
 
