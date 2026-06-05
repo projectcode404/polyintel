@@ -319,7 +319,10 @@ class PolymarketService:
     # CLOB API — live price data
     # =========================================================================
 
-    @retry(exceptions=(httpx.HTTPError, PolymarketRateLimitError))
+    @retry(
+            exceptions=(httpx.HTTPError, PolymarketRateLimitError, PolymarketAPIError),
+            exclude_on=lambda exc: getattr(exc, 'status_code', None) == 404
+    )
     def get_orderbook(self, condition_id: str) -> RawOrderbook | ClosedMarketSignal | None:
         """
         Fetch live orderbook untuk satu market.

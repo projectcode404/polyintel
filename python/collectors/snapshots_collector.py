@@ -233,6 +233,17 @@ class SnapshotsCollector:
         def fetch_single(cid: str) -> tuple[str, RawOrderbook | ClosedMarketSignal | None]:
             try:
                 return cid, self._polymarket.get_orderbook(cid)
+            except PolymarketAPIError as exc:
+                # 404 = permanent, orderbook tidak ada → mark closed
+                if exc.status_code == 404:
+                    log.info(
+                        "orderbook_404_treating_as_closed",
+                        condition_id=cid,
+                    )
+                    return cid, ClosedMarketSignal(condition_id=cid, reason="no_orderbook")
+                # 5xx atau lainnya = transient, skip run ini saja
+                log.error("orderbook_fetch_failed", condition_id=cid, error=str(exc))
+                return cid, None
             except Exception as exc:
                 log.error("orderbook_fetch_failed", condition_id=cid, error=str(exc))
                 return cid, None
