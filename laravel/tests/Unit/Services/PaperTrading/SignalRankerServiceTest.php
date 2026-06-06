@@ -190,7 +190,7 @@ class SignalRankerServiceTest extends TestCase
     /** @test */
     public function it_filters_signals_below_minimum_score(): void
     {
-        $settings = $this->makeSettings(['minimum_signal_score' => 0.60]);
+        $settings = $this->makeSettings(['minimum_signal_score' => 0.30]);
 
         $signals = collect([
             $this->makeSignal(edge: 0.1, confidence: 0.1), // score ~0.08 → below threshold

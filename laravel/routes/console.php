@@ -2,6 +2,7 @@
 
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Schedule;
+use App\Jobs\ProcessSignalCycleJob;
 
 Artisan::command('inspire', function () {
     $this->comment(\Illuminate\Foundation\Inspiring::quote());
