@@ -633,14 +633,25 @@ class PolymarketService:
             return "active"
         return "paused"
 
+    # Micro market patterns — always excluded regardless of crypto keywords.
+    # These are 5-minute direction markets with no exploitable edge.
+    MICRO_MARKET_PATTERNS = (
+        "up or down",
+    )
+
     def _is_crypto(self, data: dict[str, Any]) -> bool:
+        question = (data.get("question") or "").lower()
+
+        # Exclude micro/noise markets first
+        if any(p in question for p in self.MICRO_MARKET_PATTERNS):
+            return False
+
         category = (data.get("category") or "").lower()
         if "crypto" in category:
             return True
         tags = self._extract_tags(data)
         if {t.lower() for t in tags} & self.CRYPTO_TAGS:
             return True
-        question = (data.get("question") or "").lower()
         return any(kw in question for kw in self.CRYPTO_QUESTION_KEYWORDS)
 
     def _classify_market(self, data: dict[str, Any], tags: list[str]) -> tuple[str, str | None]:

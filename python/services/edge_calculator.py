@@ -25,6 +25,8 @@ class EdgeCalculator:
     def __init__(self):
         # Volume
         self.min_volume_threshold = Decimal("10000.00")
+        # Minimum edge untuk generate signal — di bawah ini tidak worth trading
+        self.MIN_EDGE = Decimal("0.05")
 
         # Rule 1: Extreme probability thresholds
         self.extreme_prob_low  = Decimal("0.15")
@@ -32,7 +34,7 @@ class EdgeCalculator:
 
         # Guard: prob di luar range ini kemungkinan data stale/resolved
         # bukan peluang nyata — jangan generate signal
-        self.PROB_FLOOR   = Decimal("0.02")   # < 2% = suspect
+        self.PROB_FLOOR   = Decimal("0.05")   # < 5% = suspect, not exploitable
         self.PROB_CEILING = Decimal("0.98")   # > 98% = suspect
 
         # Rule 2: Momentum
@@ -162,6 +164,8 @@ class EdgeCalculator:
                         "context":        context,
                     })
 
+        # Filter: only return signals with meaningful edge
+        signals = [s for s in signals if Decimal(str(s["edge"])) >= self.MIN_EDGE]
         return signals
 
     # -------------------------------------------------------------------------

@@ -56,6 +56,10 @@ class SignalCollector:
                         Market.end_date == None,
                         Market.end_date > now,
                     ),
+                    # Exclude micro/noise markets:
+                    # "Up or Down" = 5-minute price direction markets,
+                    # probability always ~50/50, no real edge possible.
+                    Market.question.notilike("%up or down%"),
                 )
             ).all()
 
