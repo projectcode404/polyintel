@@ -3,6 +3,7 @@
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Schedule;
 use App\Jobs\ProcessSignalCycleJob;
+use App\Jobs\SmartExitMonitorJob;
 
 Artisan::command('inspire', function () {
     $this->comment(\Illuminate\Foundation\Inspiring::quote());
@@ -24,3 +25,4 @@ Schedule::command('trade:auto-close')
 
 // Process signal cycles (e.g. check for cycle completion, update statuses, etc.)
 Schedule::job(new ProcessSignalCycleJob())->everyFiveMinutes();
+Schedule::job(new SmartExitMonitorJob())->everyMinute()->withoutOverlapping();
