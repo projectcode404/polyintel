@@ -20,3 +20,6 @@ Schedule::command('trade:auto-close')
     ->everyFiveMinutes()
     ->withoutOverlapping()
     ->runInBackground();
+
+// Process signal cycles (e.g. check for cycle completion, update statuses, etc.)
+Schedule::job(new ProcessSignalCycleJob())->everyFiveMinutes();
