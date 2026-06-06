@@ -85,7 +85,14 @@ final class ProcessSignalCycleJob implements ShouldQueue
             ->with('market')
             ->orderBy('fired_at', 'desc')
             ->get()
-            ->map(fn ($signal) => $signal->toArray());
+            ->map(function ($signal) {
+                $arr = $signal->toArray();
+                if (empty($arr['current_price']) || (float) $arr['current_price'] === 0.0) {
+                    $snapshot = is_array($arr['snapshot_data']) ? $arr['snapshot_data'] : [];
+                    $arr['current_price'] = (float) ($snapshot['price_entry'] ?? 0);
+                }
+                return $arr;
+            });
     }
 
     // =========================================================================
