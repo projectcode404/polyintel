@@ -133,6 +133,34 @@ class Signal(Base):
         comment="Copied from market_outcomes.resolved_at — actual market resolution time.",
     )
 
+    # -------------------------------------------------------------------------
+    # Sprint 4 — Raw market metrics at signal time
+    # Diisi oleh signal_repository.py dari EdgeCalculator context.
+    # Digunakan oleh SignalRankerService untuk composite score.
+    # Semua nullable: signal lama sebelum Sprint 4 tidak punya nilai ini.
+    # -------------------------------------------------------------------------
+
+    momentum_24h_percent: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(10, 6),
+        nullable=True,
+        comment="24h probability momentum percent at signal time",
+    )
+    liquidity_usd: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(20, 2),
+        nullable=True,
+        comment="Market liquidity (USD) from snapshot at signal time",
+    )
+    volume_24h_usd: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(20, 2),
+        nullable=True,
+        comment="24h trading volume (USD) at signal time",
+    )
+    spread: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(8, 6),
+        nullable=True,
+        comment="Bid-ask spread at signal time",
+    )
+
     # --- Timestamps ---
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

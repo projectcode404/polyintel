@@ -7,6 +7,7 @@ namespace App\Services\PaperTrading;
 use App\Models\PaperTrade;
 use App\Models\PaperTradeHistory;
 use App\Models\PaperTradeSetting;
+use App\Models\TradingAccount;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -53,7 +54,7 @@ final class PortfolioManagerService
      * @param  Collection  $signals  Signal Eloquent models or arrays
      * @return array{opened: int, skipped: int, reasons: array<int, array{signal_id: int|null, reason: string}>}
      */
-    public function processCycle(Collection $signals): array
+    public function processCycle(Collection $signals, TradingAccount $account): array
     {
         $settings = PaperTradeSetting::current();
         $state    = $this->metricsService->getPortfolioState($settings);
@@ -82,7 +83,7 @@ final class PortfolioManagerService
 
         // Step 3: Attempt to open each eligible signal in score order
         foreach ($eligible as $signal) {
-            $outcome = $this->attemptOpen($signal, $settings, $state);
+            $outcome = $this->attemptOpen($signal, $settings, $state, $account);
 
             if ($outcome['opened']) {
                 $results['opened']++;
@@ -115,7 +116,7 @@ final class PortfolioManagerService
      *
      * @return array{opened: bool, reason: string|null}
      */
-    private function attemptOpen(array $signal, PaperTradeSetting $settings, array $state): array
+    private function attemptOpen(array $signal, PaperTradeSetting $settings, array $state, TradingAccount $account): array
     {
         // Guard 1: max concurrent trades
         if ($state['open_trades_count'] >= (int) $settings->max_concurrent_trades) {
@@ -175,7 +176,7 @@ final class PortfolioManagerService
         try {
             DB::transaction(function () use ($signal, $settings, $entryPrice, $positionSize, $shares, $exitLevels) {
                 $trade = PaperTrade::create([
-                    'trading_account_id'           => $settings->trading_account_id ?? null,
+                    'trading_account_id'           => $account->id,
                     'market_id'                    => $signal['market_id'],
                     'signal_id'                    => $signal['id'] ?? null,
                     'direction'                    => $signal['direction'] ?? 'YES',

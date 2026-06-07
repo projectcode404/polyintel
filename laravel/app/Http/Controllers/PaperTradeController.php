@@ -54,7 +54,7 @@ class PaperTradeController extends Controller
         $trades    = $query->offset($startRow)->limit($limit)->get();
 
         $rows = $trades->map(function ($trade) {
-            $isOpen = strtolower($trade->status ?? '') === 'open';
+            $isOpen = $trade->isOpen();
 
             return [
                 'id'                    => $trade->id,
@@ -103,7 +103,7 @@ class PaperTradeController extends Controller
             abort(403, 'Unauthorized');
         }
 
-        if ($trade->status !== 'open') {
+        if (! $trade->isOpen()) {
             return back()->with('error', 'Trade is already closed.');
         }
 

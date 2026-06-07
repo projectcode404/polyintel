@@ -80,6 +80,9 @@ class EdgeCalculator:
                            if daily_stat and daily_stat.volume_7d_avg_usd else None,
             "momentum":    float(daily_stat.momentum_24h_percent)
                            if daily_stat and daily_stat.momentum_24h_percent else None,
+            "liquidity":   float(latest_snapshot.liquidity_usd),
+            "spread":      float(latest_snapshot.spread)
+                           if latest_snapshot.spread is not None else None,
             "confidence":  0.8,
         }
 

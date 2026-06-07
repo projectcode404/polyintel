@@ -72,7 +72,7 @@ final class PaperTradingService
                 'market_probability_at_entry' => $signal->market_probability_at_signal,
                 'ai_probability_at_entry'     => $signal->ai_probability_at_signal,
                 'edge_at_entry'               => $signal->edge_at_signal,
-                'status'                      => 'open',
+                'status'                      => PaperTrade::STATUS_OPEN,
                 'entered_at'                  => now(),
             ]);
 
@@ -88,14 +88,14 @@ final class PaperTradingService
      */
     public function closeTrade(PaperTrade $trade, float $exitPrice, string $outcome = null): PaperTrade
     {
-        if ($trade->status !== 'open') {
+        if (! $trade->isOpen()) {
             return $trade;
         }
 
         return DB::transaction(function () use ($trade, $exitPrice, $outcome) {
             $trade = PaperTrade::where('id', $trade->id)->lockForUpdate()->first();
             
-            if ($trade->status !== 'open') {
+            if (! $trade->isOpen()) {
                 return $trade;
             }
 
@@ -128,7 +128,7 @@ final class PaperTradingService
                 'fees_usd'             => $totalFees,
                 'pnl_usd'              => $netPnlUsd,
                 'roi'                  => $roi,
-                'status'               => 'closed',
+                'status'               => PaperTrade::STATUS_CLOSED,
                 'outcome'              => $outcome,
                 'holding_period_hours' => $holdingPeriodHours,
                 'exited_at'            => now(),

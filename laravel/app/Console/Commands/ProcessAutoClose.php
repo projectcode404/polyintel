@@ -22,7 +22,7 @@ class ProcessAutoClose extends Command
         $this->info('Unrealized PnL updated.');
 
         // Find open trades whose market has an outcome
-        $openTrades = PaperTrade::where('status', 'open')
+        $openTrades = PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES)
             ->whereHas('market', function ($query) {
                 $query->where('status', 'resolved')
                       ->has('outcome');

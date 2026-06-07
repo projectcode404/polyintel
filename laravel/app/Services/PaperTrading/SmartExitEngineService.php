@@ -205,14 +205,19 @@ final class SmartExitEngineService
     }
 
     /**
-     * Rule 5: Opposite direction signal exists with higher score.
-     * Checks signals table for same market, opposite direction, status pending.
+     * Rule 5: Opposite direction signal exists (not expired) for same market.
+     *
+     * Triggers FULL_EXIT when an opposing signal appears — interpreted as a
+     * market reversal. Score comparison is intentionally omitted: signals reach
+     * 'pending' status only after passing SignalRankerService minimum_signal_score
+     * filter. Any surviving pending opposite signal is a valid reversal indicator.
+     *
+     * Note: Signal.score is not a persistent DB column — it is a runtime key
+     * added by SignalRankerService::rank() via array_merge(). Score-based
+     * comparison requires persisting score to signals table (Sprint 4 item).
      */
     private function hasOppositeSignal(PaperTrade $trade): bool
     {
-        $currentSignal = $trade->signal;
-        $currentScore  = $currentSignal ? (float) ($currentSignal->score ?? 0) : 0;
-
         $oppositeDirection = strtolower((string) $trade->direction) === 'yes' ? 'no' : 'yes';
 
         return Signal::where('market_id', $trade->market_id)

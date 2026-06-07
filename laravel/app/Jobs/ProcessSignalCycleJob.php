@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Models\Signal;
+use App\Models\TradingAccount;
 use App\Services\PaperTrading\PortfolioManagerService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -55,16 +56,39 @@ final class ProcessSignalCycleJob implements ShouldQueue
             'count' => $signals->count(),
         ]);
 
-        $results = $portfolioManager->processCycle($signals);
 
-        Log::info('[ProcessSignalCycleJob] Cycle complete', [
-            'opened'  => $results['opened'],
-            'skipped' => $results['skipped'],
+        $accounts = TradingAccount::where('is_auto_trade', true)->get();
+
+        if ($accounts->isEmpty()) {
+            Log::info('[ProcessSignalCycleJob] No accounts with auto-trade enabled. Cycle skipped.');
+            return;
+        }
+
+        Log::info('[ProcessSignalCycleJob] Processing accounts', [
+            'signals'  => $signals->count(),
+            'accounts' => $accounts->count(),
         ]);
 
-        if (! empty($results['reasons'])) {
-            Log::debug('[ProcessSignalCycleJob] Skip reasons', $results['reasons']);
+        $totalOpened  = 0;
+        $totalSkipped = 0;
+
+        foreach ($accounts as $account) {
+            Log::info('[ProcessSignalCycleJob] Processing account', ['account_id' => $account->id]);
+
+            $results = $portfolioManager->processCycle($signals, $account);
+
+            $totalOpened  += $results['opened'];
+            $totalSkipped += $results['skipped'];
+
+            if (! empty($results['reasons'])) {
+                Log::debug('[ProcessSignalCycleJob] Skip reasons', $results['reasons']);
+            }
         }
+
+        Log::info('[ProcessSignalCycleJob] Cycle complete', [
+            'opened'  => $totalOpened,
+            'skipped' => $totalSkipped,
+        ]);
     }
 
     // =========================================================================

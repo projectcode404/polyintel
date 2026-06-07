@@ -94,12 +94,10 @@
                     <dt class="col-5 text-muted small">Fees</dt>
                     <dd class="col-7 text-muted">${{ number_format($paperTrade->fees_usd, 4) }}</dd>
 
-                    @if($paperTrade->signal)
+                    @if($paperTrade->signal_score !== null)
                     <dt class="col-5 text-muted small">Signal Score</dt>
                     <dd class="col-7">
-                        {{ $paperTrade->signal->confidence_at_signal
-                            ? round((float)$paperTrade->signal->confidence_at_signal * 100, 1) . '%'
-                            : 'N/A' }}
+                        {{ round((float)$paperTrade->signal_score * 100, 1) . '%' }}
                     </dd>
                     @endif
 

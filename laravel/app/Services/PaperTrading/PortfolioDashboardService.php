@@ -340,8 +340,8 @@ final class PortfolioDashboardService
             'position_size'   => round((float) $trade->position_size_usd, 2),
             'pnl_usd'         => round($pnlUsd, 2),
             'pnl_percent'     => round($pnlPercent, 2),
-            'signal_score'    => $trade->signal?->confidence_at_signal
-                ? round((float) $trade->signal->confidence_at_signal * 100, 1)
+            'signal_score'    => $trade->signal_score !== null
+                ? round((float) $trade->signal_score * 100, 1)
                 : null,
             'take_profit'     => $trade->take_profit_price
                 ? round((float) $trade->take_profit_price * 100, 2)

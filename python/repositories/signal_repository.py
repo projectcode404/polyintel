@@ -46,12 +46,16 @@ class SignalRepository:
                     market_probability_at_signal=s_data["context"]["price_entry"],
                     edge_at_signal=s_data["edge"],
                     confidence_at_signal=s_data["context"]["confidence"],
-                    min_edge_threshold=0.05, # Can be dynamic based on rule
+                    min_edge_threshold=0.05,
                     trigger_source=rule_name,
                     status="pending",
                     snapshot_data=s_data["context"],
                     fired_at=now,
-                    expires_at=now + timedelta(hours=24) # Signals expire in 24h by default
+                    expires_at=now + timedelta(hours=24),
+                    momentum_24h_percent=s_data["context"].get("momentum"),
+                    volume_24h_usd=s_data["context"].get("volume_24h"),
+                    liquidity_usd=s_data["context"].get("liquidity"),
+                    spread=s_data["context"].get("spread"),
                 )
                 
                 session.add(new_signal)

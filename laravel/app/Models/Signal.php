@@ -116,6 +116,14 @@ final class Signal extends Model
             });
     }
 
+    public function scopeNotExpired($query)
+    {
+        return $query->where(function ($q) {
+            $q->whereNull('expires_at')
+              ->orWhere('expires_at', '>', now());
+        });
+    }
+
     // =========================================================================
     // Helpers
     // =========================================================================
