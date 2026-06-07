@@ -175,6 +175,7 @@ The philosophy is:
 
 Project Structure
 
+```text
 polyintel/
 ├── laravel/
 │   ├── app/
@@ -191,6 +192,7 @@ polyintel/
 │
 ├── docker-compose.yml
 └── README.md
+```
 
 ---
 
