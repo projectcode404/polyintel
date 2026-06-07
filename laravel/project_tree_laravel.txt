@@ -1,0 +1,320 @@
+.
+├── Dockerfile
+├── README.md
+├── app
+│   ├── Console
+│   │   └── Commands
+│   ├── Http
+│   │   ├── Controllers
+│   │   └── Requests
+│   ├── Jobs
+│   │   ├── ProcessSignalCycleJob.php
+│   │   └── SmartExitMonitorJob.php
+│   ├── Models
+│   │   ├── AiPrediction.php
+│   │   ├── Market.php
+│   │   ├── MarketDailyStat.php
+│   │   ├── MarketOutcome.php
+│   │   ├── MarketSnapshot.php
+│   │   ├── PaperTrade.php
+│   │   ├── PaperTradeHistory.php
+│   │   ├── PaperTradeSetting.php
+│   │   ├── Signal.php
+│   │   ├── SystemSetting.php
+│   │   ├── TradingAccount.php
+│   │   └── User.php
+│   ├── Providers
+│   │   └── AppServiceProvider.php
+│   ├── Services
+│   │   ├── DashboardService.php
+│   │   ├── MarketAnalyticsService.php
+│   │   ├── PaperTrading
+│   │   ├── PaperTradingService.php
+│   │   ├── PortfolioService.php
+│   │   └── SignalService.php
+│   └── View
+│       └── Components
+├── artisan
+├── bootstrap
+│   ├── app.php
+│   ├── cache
+│   │   ├── packages.php
+│   │   └── services.php
+│   └── providers.php
+├── composer.json
+├── composer.lock
+├── config
+│   ├── app.php
+│   ├── auth.php
+│   ├── cache.php
+│   ├── database.php
+│   ├── filesystems.php
+│   ├── logging.php
+│   ├── mail.php
+│   ├── permission.php
+│   ├── queue.php
+│   ├── services.php
+│   └── session.php
+├── database
+│   ├── database.sqlite
+│   ├── factories
+│   │   ├── MarketFactory.php
+│   │   ├── PaperTradeFactory.php
+│   │   ├── SignalFactory.php
+│   │   └── UserFactory.php
+│   ├── migrations
+│   │   ├── 0001_01_01_000000_create_users_table.php
+│   │   ├── 0001_01_01_000001_create_cache_table.php
+│   │   ├── 0001_01_01_000002_create_jobs_table.php
+│   │   ├── 2024_01_01_000001_create_markets_table.php
+│   │   ├── 2024_01_01_000002_create_market_snapshots_table.php
+│   │   ├── 2024_01_01_000003_create_market_outcomes_table.php
+│   │   ├── 2024_01_01_000004_create_ai_predictions_table.php
+│   │   ├── 2024_01_01_000005_create_signals_table.php
+│   │   ├── 2024_01_01_000006_create_paper_trades_table.php
+│   │   ├── 2026_05_00001_add_enrichment_fields_to_markets_table.php
+│   │   ├── 2026_06_01_095709_create_permission_tables.php
+│   │   ├── 2026_06_03_000001_create_trading_accounts_table.php
+│   │   ├── 2026_06_03_000002_create_system_settings_table.php
+│   │   ├── 2026_06_03_000003_create_market_daily_stats_table.php
+│   │   ├── 2026_06_03_000004_add_sprint4_columns_to_signals_and_trades.php
+│   │   ├── 2026_06_06_000001_add_evaluation_fields_to_signals_table.php
+│   │   ├── 2026_06_06_000002_add_raw_metrics_to_signals_table.php
+│   │   ├── 2026_06_06_000003_extend_paper_trades_phase2.php
+│   │   ├── 2026_06_06_000004_create_paper_trade_history_table.php
+│   │   └── 2026_06_06_000005_create_paper_trade_settings_table.php
+│   └── seeders
+│       ├── AdminUserSeeder.php
+│       ├── DatabaseSeeder.php
+│       └── RoleSeeder.php
+├── package.json
+├── phpunit.xml
+├── postcss.config.js
+├── project_tree.txt
+├── project_tree_laravel.txt
+├── public
+│   ├── favicon.ico
+│   ├── index.php
+│   └── robots.txt
+├── resources
+│   ├── css
+│   │   └── app.css
+│   ├── js
+│   │   ├── app.js
+│   │   └── bootstrap.js
+│   └── views
+│       ├── admin
+│       ├── auth
+│       ├── dashboard
+│       ├── layouts
+│       ├── markets
+│       ├── paper-trades
+│       ├── partials
+│       ├── placeholder
+│       ├── signals
+│       └── welcome.blade.php
+├── routes
+│   ├── auth.php
+│   ├── console.php
+│   ├── web.php
+│   └── web_old.php
+├── storage
+│   ├── app
+│   │   ├── private
+│   │   └── public
+│   ├── framework
+│   │   ├── cache
+│   │   ├── sessions
+│   │   ├── testing
+│   │   └── views
+│   └── logs
+│       └── laravel.log
+├── tailwind.config.js
+├── tests
+│   ├── Feature
+│   │   ├── Auth
+│   │   ├── DatabaseSafetyTest.php
+│   │   ├── ExampleTest.php
+│   │   └── ProfileTest.php
+│   ├── TestCase.php
+│   └── Unit
+│       ├── ExampleTest.php
+│       └── Services
+├── vendor
+│   ├── autoload.php
+│   ├── bin
+│   │   ├── carbon
+│   │   ├── patch-type-declarations
+│   │   ├── php-parse
+│   │   ├── phpunit
+│   │   ├── pint
+│   │   ├── psysh
+│   │   ├── sail
+│   │   ├── var-dump-server
+│   │   └── yaml-lint
+│   ├── brick
+│   │   └── math
+│   ├── carbonphp
+│   │   └── carbon-doctrine-types
+│   ├── composer
+│   │   ├── ClassLoader.php
+│   │   ├── InstalledVersions.php
+│   │   ├── LICENSE
+│   │   ├── autoload_classmap.php
+│   │   ├── autoload_files.php
+│   │   ├── autoload_namespaces.php
+│   │   ├── autoload_psr4.php
+│   │   ├── autoload_real.php
+│   │   ├── autoload_static.php
+│   │   ├── installed.json
+│   │   ├── installed.php
+│   │   └── platform_check.php
+│   ├── dflydev
+│   │   └── dot-access-data
+│   ├── doctrine
+│   │   ├── inflector
+│   │   └── lexer
+│   ├── dragonmantank
+│   │   └── cron-expression
+│   ├── egulias
+│   │   └── email-validator
+│   ├── fakerphp
+│   │   └── faker
+│   ├── filp
+│   │   └── whoops
+│   ├── fruitcake
+│   │   └── php-cors
+│   ├── graham-campbell
+│   │   └── result-type
+│   ├── guzzlehttp
+│   │   ├── guzzle
+│   │   ├── promises
+│   │   ├── psr7
+│   │   └── uri-template
+│   ├── hamcrest
+│   │   └── hamcrest-php
+│   ├── laravel
+│   │   ├── breeze
+│   │   ├── framework
+│   │   ├── pail
+│   │   ├── pint
+│   │   ├── prompts
+│   │   ├── sail
+│   │   ├── serializable-closure
+│   │   └── tinker
+│   ├── league
+│   │   ├── commonmark
+│   │   ├── config
+│   │   ├── flysystem
+│   │   ├── flysystem-local
+│   │   ├── mime-type-detection
+│   │   ├── uri
+│   │   └── uri-interfaces
+│   ├── mockery
+│   │   └── mockery
+│   ├── monolog
+│   │   └── monolog
+│   ├── myclabs
+│   │   └── deep-copy
+│   ├── nesbot
+│   │   └── carbon
+│   ├── nette
+│   │   ├── schema
+│   │   └── utils
+│   ├── nikic
+│   │   └── php-parser
+│   ├── nunomaduro
+│   │   ├── collision
+│   │   └── termwind
+│   ├── phar-io
+│   │   ├── manifest
+│   │   └── version
+│   ├── phpoption
+│   │   └── phpoption
+│   ├── phpunit
+│   │   ├── php-code-coverage
+│   │   ├── php-file-iterator
+│   │   ├── php-invoker
+│   │   ├── php-text-template
+│   │   ├── php-timer
+│   │   └── phpunit
+│   ├── psr
+│   │   ├── clock
+│   │   ├── container
+│   │   ├── event-dispatcher
+│   │   ├── http-client
+│   │   ├── http-factory
+│   │   ├── http-message
+│   │   ├── log
+│   │   └── simple-cache
+│   ├── psy
+│   │   └── psysh
+│   ├── ralouphie
+│   │   └── getallheaders
+│   ├── ramsey
+│   │   ├── collection
+│   │   └── uuid
+│   ├── sebastian
+│   │   ├── cli-parser
+│   │   ├── code-unit
+│   │   ├── code-unit-reverse-lookup
+│   │   ├── comparator
+│   │   ├── complexity
+│   │   ├── diff
+│   │   ├── environment
+│   │   ├── exporter
+│   │   ├── global-state
+│   │   ├── lines-of-code
+│   │   ├── object-enumerator
+│   │   ├── object-reflector
+│   │   ├── recursion-context
+│   │   ├── type
+│   │   └── version
+│   ├── spatie
+│   │   ├── laravel-package-tools
+│   │   └── laravel-permission
+│   ├── staabm
+│   │   └── side-effects-detector
+│   ├── symfony
+│   │   ├── clock
+│   │   ├── console
+│   │   ├── css-selector
+│   │   ├── deprecation-contracts
+│   │   ├── error-handler
+│   │   ├── event-dispatcher
+│   │   ├── event-dispatcher-contracts
+│   │   ├── finder
+│   │   ├── http-foundation
+│   │   ├── http-kernel
+│   │   ├── mailer
+│   │   ├── mime
+│   │   ├── polyfill-ctype
+│   │   ├── polyfill-intl-grapheme
+│   │   ├── polyfill-intl-idn
+│   │   ├── polyfill-intl-normalizer
+│   │   ├── polyfill-mbstring
+│   │   ├── polyfill-php80
+│   │   ├── polyfill-php83
+│   │   ├── polyfill-php84
+│   │   ├── polyfill-php85
+│   │   ├── polyfill-uuid
+│   │   ├── process
+│   │   ├── routing
+│   │   ├── service-contracts
+│   │   ├── string
+│   │   ├── translation
+│   │   ├── translation-contracts
+│   │   ├── uid
+│   │   ├── var-dumper
+│   │   └── yaml
+│   ├── theseer
+│   │   └── tokenizer
+│   ├── tijsverkoyen
+│   │   └── css-to-inline-styles
+│   ├── vlucas
+│   │   └── phpdotenv
+│   └── voku
+│       └── portable-ascii
+└── vite.config.js
+
+204 directories, 114 files

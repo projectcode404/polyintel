@@ -195,7 +195,13 @@ final class SmartExitEngineService
         }
 
         $endDate = \Carbon\Carbon::parse($market->end_date);
-        return $endDate->diffInHours(now()) < 6;
+        // Already expired
+        if ($endDate->isPast()) {
+            return true;
+        }
+
+        // Less than 6 hours remaining
+        return now()->diffInHours($endDate, absolute: false) < 6;
     }
 
     /**

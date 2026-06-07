@@ -95,10 +95,12 @@ class SmartExitEngineServiceTest extends TestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function it_moves_to_breakeven_when_trigger_is_hit(): void
     {
+        // takeProfit must be higher than breakeven to avoid TP1 firing first
+        // At price 0.61: above breakeven(0.60) but below TP(0.90) → MOVE_TO_BREAKEVEN
         $trade = $this->makeTrade(
             entry: 0.5,
             stopLoss: 0.40,
-            takeProfit: 0.60,
+            takeProfit: 0.90,
             breakeven: 0.60
         );
 
@@ -165,7 +167,11 @@ class SmartExitEngineServiceTest extends TestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function it_triggers_partial_exit_on_momentum_reversal(): void
     {
+        // Market with far end_date ensures isNearExpiry does not trigger first
+        $market = Market::factory()->create(['end_date' => now()->addDays(60)]);
+
         $signal = Signal::factory()->create([
+            'market_id'            => $market->id,
             'momentum_24h_percent' => -15.0,
         ]);
 
@@ -173,10 +179,11 @@ class SmartExitEngineServiceTest extends TestCase
             entry: 0.5,
             stopLoss: 0.40,
             takeProfit: 0.80,
+            marketId: $market->id,
             signalId: $signal->id
         );
 
-        $trade->load('signal');
+        $trade->load(['signal', 'market']);
 
         $decision = $this->engine->evaluate($trade, 0.52);
 
@@ -191,8 +198,21 @@ class SmartExitEngineServiceTest extends TestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function it_returns_no_action_when_no_conditions_met(): void
     {
-        $trade = $this->makeTrade(entry: 0.5, stopLoss: 0.40, takeProfit: 0.80);
+        // Disable smart exit so smart rules do not interfere
+        $settings = PaperTradeSetting::current();
+        $settings->enable_smart_exit = false;
+        $settings->save();
 
+        // Market with far end_date, price between SL and TP → NO_ACTION
+        $market = Market::factory()->create(['end_date' => now()->addDays(60)]);
+        $trade  = $this->makeTrade(
+            entry: 0.5,
+            stopLoss: 0.40,
+            takeProfit: 0.80,
+            marketId: $market->id
+        );
+
+        $trade->load('market');
         $decision = $this->engine->evaluate($trade, 0.52);
 
         $this->assertSame(SmartExitDecision::NO_ACTION, $decision->action);

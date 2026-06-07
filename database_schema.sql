@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict TrwfKqyYGQULUhypBeJ9G3cJGgG5qcWICbNQg6e2GNLamREaWRJIPd9hRnKI1d1
+\restrict RmZEpRex6VY1VOt9XKDbaqY9mkvsIkBogFIhsRc6lfc20UYnShGVJdAsV2PsBcZ
 
 -- Dumped from database version 15.17
 -- Dumped by pg_dump version 15.17
@@ -17,6 +17,22 @@ SET check_function_bodies = false;
 SET xmloption = content;
 SET client_min_messages = warning;
 SET row_security = off;
+
+--
+-- Name: public; Type: SCHEMA; Schema: -; Owner: sikapiapsby
+--
+
+-- *not* creating schema, since initdb creates it
+
+
+ALTER SCHEMA public OWNER TO sikapiapsby;
+
+--
+-- Name: SCHEMA public; Type: COMMENT; Schema: -; Owner: sikapiapsby
+--
+
+COMMENT ON SCHEMA public IS '';
+
 
 SET default_tablespace = '';
 
@@ -841,6 +857,113 @@ CREATE TABLE public.model_has_roles (
 ALTER TABLE public.model_has_roles OWNER TO sikapiapsby;
 
 --
+-- Name: paper_trade_history; Type: TABLE; Schema: public; Owner: sikapiapsby
+--
+
+CREATE TABLE public.paper_trade_history (
+    id bigint NOT NULL,
+    paper_trade_id bigint NOT NULL,
+    event_type character varying(255) NOT NULL,
+    price_at_event numeric(15,8) NOT NULL,
+    shares_affected numeric(15,8) DEFAULT '0'::numeric NOT NULL,
+    pnl_realized numeric(15,2) DEFAULT '0'::numeric NOT NULL,
+    reason text,
+    created_at timestamp(0) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT paper_trade_history_event_type_check CHECK (((event_type)::text = ANY (ARRAY[('OPENED'::character varying)::text, ('PARTIAL_CLOSE'::character varying)::text, ('TP1'::character varying)::text, ('TP2'::character varying)::text, ('TP3'::character varying)::text, ('STOP_LOSS'::character varying)::text, ('BREAKEVEN_MOVED'::character varying)::text, ('SMART_EXIT'::character varying)::text, ('CLOSED'::character varying)::text, ('EXPIRED'::character varying)::text])))
+);
+
+
+ALTER TABLE public.paper_trade_history OWNER TO sikapiapsby;
+
+--
+-- Name: paper_trade_history_id_seq; Type: SEQUENCE; Schema: public; Owner: sikapiapsby
+--
+
+CREATE SEQUENCE public.paper_trade_history_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.paper_trade_history_id_seq OWNER TO sikapiapsby;
+
+--
+-- Name: paper_trade_history_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: sikapiapsby
+--
+
+ALTER SEQUENCE public.paper_trade_history_id_seq OWNED BY public.paper_trade_history.id;
+
+
+--
+-- Name: paper_trade_settings; Type: TABLE; Schema: public; Owner: sikapiapsby
+--
+
+CREATE TABLE public.paper_trade_settings (
+    id bigint NOT NULL,
+    initial_capital numeric(15,2) DEFAULT '1000'::numeric NOT NULL,
+    max_portfolio_exposure_percent numeric(5,2) DEFAULT '50'::numeric NOT NULL,
+    max_concurrent_trades integer DEFAULT 10 NOT NULL,
+    reserve_cash_percent numeric(5,2) DEFAULT '20'::numeric NOT NULL,
+    max_position_per_market integer DEFAULT 1 NOT NULL,
+    market_cooldown_minutes integer DEFAULT 60 NOT NULL,
+    position_size_mode character varying(255) DEFAULT 'fixed_percent'::character varying NOT NULL,
+    fixed_amount numeric(15,2),
+    fixed_percent numeric(5,2) DEFAULT '2'::numeric,
+    enable_dynamic_position_size boolean DEFAULT false NOT NULL,
+    enable_top_signal_filter boolean DEFAULT true NOT NULL,
+    max_signals_per_cycle integer DEFAULT 10 NOT NULL,
+    minimum_signal_score numeric(8,4) DEFAULT 0.7 NOT NULL,
+    enable_take_profit boolean DEFAULT true NOT NULL,
+    take_profit_mode character varying(255) DEFAULT 'r_multiple'::character varying NOT NULL,
+    take_profit_r1 numeric(5,2) DEFAULT '1'::numeric,
+    take_profit_r2 numeric(5,2),
+    take_profit_r3 numeric(5,2),
+    enable_stop_loss boolean DEFAULT true NOT NULL,
+    stop_loss_mode character varying(255) DEFAULT 'r_multiple'::character varying NOT NULL,
+    stop_loss_value numeric(5,2) DEFAULT '1'::numeric NOT NULL,
+    enable_move_to_breakeven boolean DEFAULT true NOT NULL,
+    breakeven_trigger_r numeric(5,2) DEFAULT '1'::numeric NOT NULL,
+    enable_partial_take_profit boolean DEFAULT false NOT NULL,
+    partial_tp1_percent numeric(5,2) DEFAULT '50'::numeric,
+    partial_tp2_percent numeric(5,2) DEFAULT '30'::numeric,
+    partial_tp3_percent numeric(5,2) DEFAULT '20'::numeric,
+    enable_smart_exit boolean DEFAULT true NOT NULL,
+    preset character varying(255) DEFAULT 'balanced'::character varying NOT NULL,
+    created_at timestamp(0) without time zone,
+    updated_at timestamp(0) without time zone,
+    CONSTRAINT paper_trade_settings_position_size_mode_check CHECK (((position_size_mode)::text = ANY (ARRAY[('fixed_amount'::character varying)::text, ('fixed_percent'::character varying)::text, ('dynamic'::character varying)::text]))),
+    CONSTRAINT paper_trade_settings_preset_check CHECK (((preset)::text = ANY (ARRAY[('conservative'::character varying)::text, ('balanced'::character varying)::text, ('aggressive'::character varying)::text, ('custom'::character varying)::text]))),
+    CONSTRAINT paper_trade_settings_stop_loss_mode_check CHECK (((stop_loss_mode)::text = ANY (ARRAY[('fixed_percent'::character varying)::text, ('r_multiple'::character varying)::text]))),
+    CONSTRAINT paper_trade_settings_take_profit_mode_check CHECK (((take_profit_mode)::text = ANY (ARRAY[('fixed_percent'::character varying)::text, ('r_multiple'::character varying)::text])))
+);
+
+
+ALTER TABLE public.paper_trade_settings OWNER TO sikapiapsby;
+
+--
+-- Name: paper_trade_settings_id_seq; Type: SEQUENCE; Schema: public; Owner: sikapiapsby
+--
+
+CREATE SEQUENCE public.paper_trade_settings_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.paper_trade_settings_id_seq OWNER TO sikapiapsby;
+
+--
+-- Name: paper_trade_settings_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: sikapiapsby
+--
+
+ALTER SEQUENCE public.paper_trade_settings_id_seq OWNED BY public.paper_trade_settings.id;
+
+
+--
 -- Name: paper_trades; Type: TABLE; Schema: public; Owner: sikapiapsby
 --
 
@@ -872,7 +995,14 @@ CREATE TABLE public.paper_trades (
     created_at timestamp(0) without time zone,
     updated_at timestamp(0) without time zone,
     deleted_at timestamp(0) without time zone,
-    trading_account_id bigint
+    trading_account_id bigint,
+    signal_score numeric(8,4),
+    position_size_mode character varying(30),
+    take_profit_price numeric(8,6),
+    stop_loss_price numeric(8,6),
+    breakeven_price numeric(8,6),
+    exit_reason character varying(50),
+    smart_exit_reason text
 );
 
 
@@ -1174,7 +1304,15 @@ CREATE TABLE public.signals (
     created_at timestamp(0) without time zone,
     updated_at timestamp(0) without time zone,
     deleted_at timestamp(0) without time zone,
-    snapshot_data json
+    snapshot_data json,
+    resolved_outcome character varying(20),
+    is_correct boolean,
+    realized_roi numeric(10,4),
+    resolved_at timestamp(0) without time zone,
+    momentum_24h_percent numeric(10,6),
+    liquidity_usd numeric(20,2),
+    volume_24h_usd numeric(20,2),
+    spread numeric(8,6)
 );
 
 
@@ -1255,6 +1393,34 @@ COMMENT ON COLUMN public.signals.expires_at IS 'Signals for time-sensitive marke
 --
 
 COMMENT ON COLUMN public.signals.snapshot_data IS 'Stores context at entry: rule_name, confidence, price_entry, volume_7d, oi_change, momentum';
+
+
+--
+-- Name: COLUMN signals.resolved_outcome; Type: COMMENT; Schema: public; Owner: sikapiapsby
+--
+
+COMMENT ON COLUMN public.signals.resolved_outcome IS 'yes | no | cancelled — copied from market_outcomes.winning_side';
+
+
+--
+-- Name: COLUMN signals.is_correct; Type: COMMENT; Schema: public; Owner: sikapiapsby
+--
+
+COMMENT ON COLUMN public.signals.is_correct IS 'True if signal direction matched winning_side. NULL = not yet evaluated.';
+
+
+--
+-- Name: COLUMN signals.realized_roi; Type: COMMENT; Schema: public; Owner: sikapiapsby
+--
+
+COMMENT ON COLUMN public.signals.realized_roi IS 'ROI % based on entry probability and outcome. NULL = not yet evaluated.';
+
+
+--
+-- Name: COLUMN signals.resolved_at; Type: COMMENT; Schema: public; Owner: sikapiapsby
+--
+
+COMMENT ON COLUMN public.signals.resolved_at IS 'Copied from market_outcomes.resolved_at — actual market resolution time.';
 
 
 --
@@ -1479,6 +1645,20 @@ ALTER TABLE ONLY public.migrations ALTER COLUMN id SET DEFAULT nextval('public.m
 
 
 --
+-- Name: paper_trade_history id; Type: DEFAULT; Schema: public; Owner: sikapiapsby
+--
+
+ALTER TABLE ONLY public.paper_trade_history ALTER COLUMN id SET DEFAULT nextval('public.paper_trade_history_id_seq'::regclass);
+
+
+--
+-- Name: paper_trade_settings id; Type: DEFAULT; Schema: public; Owner: sikapiapsby
+--
+
+ALTER TABLE ONLY public.paper_trade_settings ALTER COLUMN id SET DEFAULT nextval('public.paper_trade_settings_id_seq'::regclass);
+
+
+--
 -- Name: paper_trades id; Type: DEFAULT; Schema: public; Owner: sikapiapsby
 --
 
@@ -1669,6 +1849,22 @@ ALTER TABLE ONLY public.model_has_permissions
 
 ALTER TABLE ONLY public.model_has_roles
     ADD CONSTRAINT model_has_roles_pkey PRIMARY KEY (role_id, model_id, model_type);
+
+
+--
+-- Name: paper_trade_history paper_trade_history_pkey; Type: CONSTRAINT; Schema: public; Owner: sikapiapsby
+--
+
+ALTER TABLE ONLY public.paper_trade_history
+    ADD CONSTRAINT paper_trade_history_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: paper_trade_settings paper_trade_settings_pkey; Type: CONSTRAINT; Schema: public; Owner: sikapiapsby
+--
+
+ALTER TABLE ONLY public.paper_trade_settings
+    ADD CONSTRAINT paper_trade_settings_pkey PRIMARY KEY (id);
 
 
 --
@@ -1910,6 +2106,48 @@ CREATE INDEX outcomes_winning_side_idx ON public.market_outcomes USING btree (wi
 
 
 --
+-- Name: paper_trade_history_created_at_index; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX paper_trade_history_created_at_index ON public.paper_trade_history USING btree (created_at);
+
+
+--
+-- Name: paper_trade_history_event_type_index; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX paper_trade_history_event_type_index ON public.paper_trade_history USING btree (event_type);
+
+
+--
+-- Name: paper_trade_history_paper_trade_id_event_type_index; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX paper_trade_history_paper_trade_id_event_type_index ON public.paper_trade_history USING btree (paper_trade_id, event_type);
+
+
+--
+-- Name: paper_trade_history_paper_trade_id_index; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX paper_trade_history_paper_trade_id_index ON public.paper_trade_history USING btree (paper_trade_id);
+
+
+--
+-- Name: paper_trades_exit_reason_index; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX paper_trades_exit_reason_index ON public.paper_trades USING btree (exit_reason);
+
+
+--
+-- Name: paper_trades_signal_score_index; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX paper_trades_signal_score_index ON public.paper_trades USING btree (signal_score);
+
+
+--
 -- Name: sessions_last_activity_index; Type: INDEX; Schema: public; Owner: sikapiapsby
 --
 
@@ -1938,10 +2176,52 @@ CREATE INDEX signals_edge_idx ON public.signals USING btree (edge_at_signal);
 
 
 --
+-- Name: signals_is_correct_idx; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX signals_is_correct_idx ON public.signals USING btree (is_correct);
+
+
+--
+-- Name: signals_liquidity_usd_index; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX signals_liquidity_usd_index ON public.signals USING btree (liquidity_usd);
+
+
+--
 -- Name: signals_market_status_idx; Type: INDEX; Schema: public; Owner: sikapiapsby
 --
 
 CREATE INDEX signals_market_status_idx ON public.signals USING btree (market_id, status);
+
+
+--
+-- Name: signals_momentum_24h_percent_index; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX signals_momentum_24h_percent_index ON public.signals USING btree (momentum_24h_percent);
+
+
+--
+-- Name: signals_resolved_at_idx; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX signals_resolved_at_idx ON public.signals USING btree (resolved_at);
+
+
+--
+-- Name: signals_roi_idx; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX signals_roi_idx ON public.signals USING btree (realized_roi);
+
+
+--
+-- Name: signals_source_correct_idx; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX signals_source_correct_idx ON public.signals USING btree (trigger_source, is_correct);
 
 
 --
@@ -1956,6 +2236,13 @@ CREATE INDEX signals_source_idx ON public.signals USING btree (trigger_source);
 --
 
 CREATE INDEX signals_status_fired_idx ON public.signals USING btree (status, fired_at);
+
+
+--
+-- Name: signals_volume_24h_usd_index; Type: INDEX; Schema: public; Owner: sikapiapsby
+--
+
+CREATE INDEX signals_volume_24h_usd_index ON public.signals USING btree (volume_24h_usd);
 
 
 --
@@ -2084,6 +2371,14 @@ ALTER TABLE ONLY public.model_has_roles
 
 
 --
+-- Name: paper_trade_history paper_trade_history_paper_trade_id_foreign; Type: FK CONSTRAINT; Schema: public; Owner: sikapiapsby
+--
+
+ALTER TABLE ONLY public.paper_trade_history
+    ADD CONSTRAINT paper_trade_history_paper_trade_id_foreign FOREIGN KEY (paper_trade_id) REFERENCES public.paper_trades(id) ON DELETE CASCADE;
+
+
+--
 -- Name: paper_trades paper_trades_market_id_foreign; Type: FK CONSTRAINT; Schema: public; Owner: sikapiapsby
 --
 
@@ -2148,8 +2443,15 @@ ALTER TABLE ONLY public.trading_accounts
 
 
 --
+-- Name: SCHEMA public; Type: ACL; Schema: -; Owner: sikapiapsby
+--
+
+REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+
+
+--
 -- PostgreSQL database dump complete
 --
 
-\unrestrict TrwfKqyYGQULUhypBeJ9G3cJGgG5qcWICbNQg6e2GNLamREaWRJIPd9hRnKI1d1
+\unrestrict RmZEpRex6VY1VOt9XKDbaqY9mkvsIkBogFIhsRc6lfc20UYnShGVJdAsV2PsBcZ
 

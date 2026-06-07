@@ -1,0 +1,81 @@
+.
+├── Dockerfile
+├── __init__.py
+├── analyze_rules.py
+├── audit_raw_api_responses.py
+├── collectors
+│   ├── __init__.py
+│   ├── __pycache__
+│   │   ├── __init__.cpython-313.pyc
+│   │   ├── markets_collector.cpython-313.pyc
+│   │   ├── signal_collector.cpython-313.pyc
+│   │   ├── snapshots_collector.cpython-313.pyc
+│   │   └── stats_collector.cpython-313.pyc
+│   ├── markets_collector.py
+│   ├── signal_collector.py
+│   ├── snapshots_collector.py
+│   └── stats_collector.py
+├── config
+│   ├── __init__.py
+│   ├── __pycache__
+│   │   ├── __init__.cpython-313.pyc
+│   │   └── settings.cpython-313.pyc
+│   └── settings.py
+├── debug_clob_response.py
+├── debug_gamma_response.py
+├── diagnostic.py
+├── diagnostic_signal_quality.py
+├── logs
+├── models
+│   ├── __init__.py
+│   ├── __pycache__
+│   │   ├── __init__.cpython-313.pyc
+│   │   ├── market.cpython-313.pyc
+│   │   ├── signal.cpython-313.pyc
+│   │   └── stats.cpython-313.pyc
+│   ├── market.py
+│   ├── signal.py
+│   └── stats.py
+├── polyintel_schema.sql
+├── project_tree_python.txt
+├── repositories
+│   ├── __init__.py
+│   ├── __pycache__
+│   │   ├── __init__.cpython-313.pyc
+│   │   ├── market_repository.cpython-313.pyc
+│   │   ├── signal_analytics_repository.cpython-313.pyc
+│   │   ├── signal_repository.cpython-313.pyc
+│   │   └── snapshot_repository.cpython-313.pyc
+│   ├── market_repository.py
+│   ├── signal_analytics_repository.py
+│   ├── signal_repository.py
+│   └── snapshot_repository.py
+├── requirements.txt
+├── run_collection_pipeline.py
+├── scheduler.py
+├── services
+│   ├── __init__.py
+│   ├── __pycache__
+│   │   ├── __init__.cpython-313.pyc
+│   │   ├── edge_calculator.cpython-313.pyc
+│   │   ├── external_price_service.cpython-313.pyc
+│   │   ├── polymarket_service.cpython-313.pyc
+│   │   └── signal_evaluator.cpython-313.pyc
+│   ├── edge_calculator.py
+│   ├── external_price_service.py
+│   ├── polymarket_service.py
+│   └── signal_evaluator.py
+├── test_api_endpoints.py
+├── utils
+│   ├── __init__.py
+│   ├── __pycache__
+│   │   ├── __init__.cpython-313.pyc
+│   │   ├── db.cpython-313.pyc
+│   │   ├── logger.cpython-313.pyc
+│   │   └── retry.cpython-313.pyc
+│   ├── db.py
+│   ├── logger.py
+│   └── retry.py
+└── verify_data_quality.py
+
+14 directories, 65 files
