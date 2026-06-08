@@ -156,9 +156,9 @@ final class EquityCurveService
      * Statistik ringkas dari equity curve.
      * Digunakan untuk stat cards di atas chart.
      */
-    public function getEquitySummary(TradingAccount $account): array
+    public function getEquitySummary(TradingAccount $account, ?array $curve = null): array
     {
-        $curve = $this->getEquityCurve($account);
+        $curve = $curve ?? $this->getEquityCurve($account);
 
         $equityPoints = $curve['equity'];
         $baseline     = $curve['baseline'];

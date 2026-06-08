@@ -141,6 +141,46 @@ services:
       options:
         max-size: "20m"
         max-file: "3"
+  # ---------------------------------------------------------------------------
+  # Laravel Queue Worker — Process Signal Cycle Jobs
+  # Consumes jobs from Redis queue dispatched by the scheduler
+  # ---------------------------------------------------------------------------
+  queue:
+    build:
+      context: ./laravel
+      dockerfile: Dockerfile
+    container_name: polyintel_queue
+    restart: unless-stopped
+    command: ["php", "artisan", "queue:work", "redis", "--sleep=3", "--tries=3", "--max-time=3600"]
+    env_file:
+      - .env
+      - laravel/.env
+    volumes:
+      - ./laravel:/app
+      - laravel_storage:/app/storage
+    networks:
+      - sikap-network
+    depends_on:
+      - laravel
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 128M
+          cpus: "0.1"
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "queue:work"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
 # =============================================================================
 # Volumes
 # =============================================================================

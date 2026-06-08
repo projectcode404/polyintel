@@ -53,7 +53,7 @@ final class PaperTradeDashboardController extends Controller
 
         $overview       = $this->dashboardService->getOverviewCards($account);
         $equityCurve    = $this->equityCurveService->getDailyEquityCurve($account);
-        $equitySummary  = $this->equityCurveService->getEquitySummary($account);
+        $equitySummary  = $this->equityCurveService->getEquitySummary($account, $equityCurve);
         $smartExitStats = $this->dashboardService->getSmartExitStats($account);
         $performance    = $this->analyticsService->getFullMetrics($account);
         $recentActivity = $this->dashboardService->getRecentActivity($account, 20);

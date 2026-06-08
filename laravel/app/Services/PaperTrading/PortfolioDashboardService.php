@@ -59,10 +59,13 @@ final class PortfolioDashboardService
             : 0.0;
 
         // Win rate dari closed trades
-        $winCount  = $closedTrades->where('outcome', 'win')->count();
-        $lossCount = $closedTrades->where('outcome', 'loss')->count();
+        $winCount    = $closedTrades->where('outcome', 'win')->count();
+        $lossCount   = $closedTrades->where('outcome', 'loss')->count();
         $totalClosed = $closedTrades->count();
-        $winRate   = $totalClosed > 0 ? ($winCount / $totalClosed) * 100 : 0.0;
+        // Hanya hitung trade yang outcome definitif (win/loss).
+        // Exclude NULL, breakeven, cancelled agar win rate tidak terdilusi.
+        $ratedCount  = $winCount + $lossCount;
+        $winRate     = $ratedCount > 0 ? ($winCount / $ratedCount) * 100 : 0.0;
 
         // Profit factor
         $grossProfit = $closedTrades->where('pnl_usd', '>', 0)->sum('pnl_usd');

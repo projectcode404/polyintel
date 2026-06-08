@@ -174,7 +174,7 @@ final class PortfolioManagerService
 
         // Open trade in atomic transaction
         try {
-            DB::transaction(function () use ($signal, $settings, $entryPrice, $positionSize, $shares, $exitLevels) {
+            DB::transaction(function () use ($signal, $settings, $entryPrice, $positionSize, $shares, $exitLevels, $account) {
                 $trade = PaperTrade::create([
                     'trading_account_id'           => $account->id,
                     'market_id'                    => $signal['market_id'],

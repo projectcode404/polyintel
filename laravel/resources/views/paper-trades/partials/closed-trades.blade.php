@@ -53,11 +53,12 @@
             minWidth: 180,
             tooltipField: 'market_full',
             cellRenderer: params => {
+                if (!params.data) return params.value ?? '';
                 const dir = params.data.direction;
                 const badge = dir === 'YES'
                     ? '<span class="badge bg-success-lt me-1">YES</span>'
                     : '<span class="badge bg-danger-lt me-1">NO</span>';
-                return badge + params.value;
+                return badge + (params.value ?? '');
             },
         },
         {
@@ -78,14 +79,14 @@
             width: 95,
             sort: 'desc',
             cellClass: params => params.value >= 0 ? 'text-success fw-bold' : 'text-danger fw-bold',
-            cellRenderer: params => (params.value >= 0 ? '+' : '') + '$' + params.value.toFixed(2),
+            cellRenderer: params => params.value != null ? (params.value >= 0 ? '+' : '') + '$' + params.value.toFixed(2) : '—',
         },
         {
             headerName: 'ROI',
             field: 'roi_percent',
             width: 85,
             cellClass: params => params.value >= 0 ? 'text-success' : 'text-danger',
-            cellRenderer: params => (params.value >= 0 ? '+' : '') + params.value.toFixed(2) + '%',
+            cellRenderer: params => params.value != null ? (params.value >= 0 ? '+' : '') + params.value.toFixed(2) + '%' : '—',
         },
         {
             headerName: 'Exit Reason',
@@ -121,51 +122,52 @@
 
     let currentExitFilter = '';
 
+    function createDatasource() {
+        return {
+            getRows(params) {
+                const body = {
+                    startRow:   params.startRow,
+                    endRow:     params.endRow,
+                    sortModel:  JSON.stringify(params.sortModel ?? []),
+                    exitReason: currentExitFilter,
+                };
+                const qs = new URLSearchParams(body).toString();
+                fetch('/api/paper-trades/closed?' + qs, {
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                })
+                .then(r => r.json())
+                .then(data => {
+                    params.successCallback(data.rows, data.totalRows);
+                    document.getElementById('closedTradesCount').textContent = data.totalRows;
+                })
+                .catch(() => params.failCallback());
+            }
+        };
+    }
+
     const gridOptions = {
         columnDefs,
         defaultColDef: {
             sortable: true,
             resizable: true,
         },
-        rowModelType: 'serverSide',
-        serverSideDatasource: createDatasource(),
+        rowModelType: 'infinite',
+        datasource: createDatasource(),
         cacheBlockSize: 50,
+        maxBlocksInCache: 10,
         pagination: true,
         paginationPageSize: 25,
+        paginationPageSizeSelector: [10, 25, 50, 100],
         tooltipShowDelay: 300,
         suppressCellFocus: true,
     };
 
     const grid = agGrid.createGrid(gridEl, gridOptions);
 
-    function createDatasource() {
-        return {
-            getRows(params) {
-                const body = {
-                    startRow:   params.request.startRow,
-                    endRow:     params.request.endRow,
-                    sortModel:  JSON.stringify(params.request.sortModel),
-                    exitReason: currentExitFilter,
-                };
-                const qs = new URLSearchParams(body).toString();
-
-                fetch('/api/paper-trades/closed?' + qs, {
-                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
-                })
-                .then(r => r.json())
-                .then(data => {
-                    params.success({ rowData: data.rows, rowCount: data.totalRows });
-                    document.getElementById('closedTradesCount').textContent = data.totalRows;
-                })
-                .catch(() => params.fail());
-            }
-        };
-    }
-
     // Exit filter
     document.getElementById('closedTradesExitFilter')?.addEventListener('change', function () {
         currentExitFilter = this.value;
-        grid.setGridOption('serverSideDatasource', createDatasource());
+        grid.api.setDatasource(createDatasource());
     });
 })();
 </script>

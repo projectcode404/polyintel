@@ -337,9 +337,11 @@ document.addEventListener('DOMContentLoaded', function () {
     const gridOptions = {
         columnDefs,
         rowModelType: 'infinite',
-        cacheBlockSize: 100,
+        cacheBlockSize: 50,
         maxBlocksInCache: 10,
-        infiniteInitialRowCount: 100,
+        infiniteInitialRowCount: 50,
+        pagination: true,
+        paginationPageSize: 50,
         rowHeight: 48,
         headerHeight: 38,
         defaultColDef: {
@@ -390,12 +392,12 @@ document.addEventListener('DOMContentLoaded', function () {
     ['filterStatus', 'filterDirection'].forEach(id => {
         document.getElementById(id).addEventListener('change', () => {
             snapshotStore.clear();
-            grid.api?.purgeInfiniteCache();
+            grid.api?.refreshInfiniteCache();
         });
     });
     document.getElementById('refreshGridBtn').addEventListener('click', () => {
         snapshotStore.clear();
-        grid.api?.purgeInfiniteCache();
+        grid.api?.refreshInfiniteCache();
     });
 
     // ---- Execute Modal ----

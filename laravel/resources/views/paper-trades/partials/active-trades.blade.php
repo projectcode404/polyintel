@@ -38,11 +38,12 @@
             minWidth: 180,
             tooltipField: 'market_full',
             cellRenderer: params => {
+                if (!params.data) return params.value ?? '';
                 const dir = params.data.direction;
                 const badge = dir === 'YES'
                     ? '<span class="badge bg-success-lt me-1">YES</span>'
                     : '<span class="badge bg-danger-lt me-1">NO</span>';
-                return badge + params.value;
+                return badge + (params.value ?? '');
             },
         },
         {
@@ -61,14 +62,14 @@
             headerName: 'Size',
             field: 'position_size',
             width: 90,
-            cellRenderer: params => '$' + params.value.toFixed(2),
+            cellRenderer: params => params.value != null ? '$' + params.value.toFixed(2) : '—',
         },
         {
             headerName: 'PnL $',
             field: 'pnl_usd',
             width: 90,
             cellClass: params => params.value >= 0 ? 'text-success fw-bold' : 'text-danger fw-bold',
-            cellRenderer: params => (params.value >= 0 ? '+' : '') + '$' + params.value.toFixed(2),
+            cellRenderer: params => params.value != null ? (params.value >= 0 ? '+' : '') + '$' + params.value.toFixed(2) : '—',
             sort: 'desc',
         },
         {
@@ -76,7 +77,7 @@
             field: 'pnl_percent',
             width: 85,
             cellClass: params => params.value >= 0 ? 'text-success' : 'text-danger',
-            cellRenderer: params => (params.value >= 0 ? '+' : '') + params.value.toFixed(2) + '%',
+            cellRenderer: params => params.value != null ? (params.value >= 0 ? '+' : '') + params.value.toFixed(2) + '%' : '—',
         },
         {
             headerName: 'Score',
@@ -125,6 +126,27 @@
         },
     ];
 
+    const datasource = {
+        getRows(params) {
+            const body = {
+                startRow:  params.startRow,
+                endRow:    params.endRow,
+                sortModel: JSON.stringify(params.sortModel ?? []),
+            };
+            const qs = new URLSearchParams(body).toString();
+            fetch('/api/paper-trades/active?' + qs, {
+                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+            })
+            .then(r => r.json())
+            .then(data => {
+                params.successCallback(data.rows, data.totalRows);
+                document.getElementById('activeTradesCount').textContent = data.totalRows;
+                document.getElementById('activeTradesLastUpdated').textContent =
+                    'Updated ' + new Date().toLocaleTimeString();
+            })
+            .catch(() => params.failCallback());
+        }
+    };
     const gridOptions = {
         columnDefs,
         defaultColDef: {
@@ -132,42 +154,21 @@
             resizable: true,
             suppressMovable: false,
         },
-        rowModelType: 'serverSide',
-        serverSideDatasource: {
-            getRows(params) {
-                const body = {
-                    startRow:  params.request.startRow,
-                    endRow:    params.request.endRow,
-                    sortModel: JSON.stringify(params.request.sortModel),
-                };
-                const qs = new URLSearchParams(body).toString();
-
-                fetch('/api/paper-trades/active?' + qs, {
-                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
-                })
-                .then(r => r.json())
-                .then(data => {
-                    params.success({ rowData: data.rows, rowCount: data.totalRows });
-                    document.getElementById('activeTradesCount').textContent = data.totalRows;
-                    document.getElementById('activeTradesLastUpdated').textContent =
-                        'Updated ' + new Date().toLocaleTimeString();
-                })
-                .catch(() => params.fail());
-            }
-        },
+        rowModelType: 'infinite',
+        datasource,
         cacheBlockSize: 50,
+        maxBlocksInCache: 10,
         pagination: true,
         paginationPageSize: 25,
+        paginationPageSizeSelector: [10, 25, 50, 100],
         suppressPaginationPanel: false,
         tooltipShowDelay: 300,
         suppressCellFocus: true,
     };
-
-    agGrid.createGrid(gridEl, gridOptions);
-
+    const activeGrid = agGrid.createGrid(gridEl, gridOptions);
     // Expose refresh function untuk auto-refresh
     window.refreshActiveTradesGrid = function () {
-        gridEl.__agGrid?.api?.refreshServerSide({ purge: true });
+        activeGrid.api.purgeInfiniteCache();
     };
 })();
 </script>

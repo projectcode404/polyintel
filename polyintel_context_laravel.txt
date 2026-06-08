@@ -3171,6 +3171,14 @@ final class Signal extends Model
             });
     }
 
+    public function scopeNotExpired($query)
+    {
+        return $query->where(function ($q) {
+            $q->whereNull('expires_at')
+              ->orWhere('expires_at', '>', now());
+        });
+    }
+
     // =========================================================================
     // Helpers
     // =========================================================================
@@ -4804,8 +4812,8 @@ final class PortfolioDashboardService
             'position_size'   => round((float) $trade->position_size_usd, 2),
             'pnl_usd'         => round($pnlUsd, 2),
             'pnl_percent'     => round($pnlPercent, 2),
-            'signal_score'    => $trade->signal?->confidence_at_signal
-                ? round((float) $trade->signal->confidence_at_signal * 100, 1)
+            'signal_score'    => $trade->signal_score !== null
+                ? round((float) $trade->signal_score * 100, 1)
                 : null,
             'take_profit'     => $trade->take_profit_price
                 ? round((float) $trade->take_profit_price * 100, 2)
@@ -6069,14 +6077,19 @@ final class SmartExitEngineService
     }
 
     /**
-     * Rule 5: Opposite direction signal exists with higher score.
-     * Checks signals table for same market, opposite direction, status pending.
+     * Rule 5: Opposite direction signal exists (not expired) for same market.
+     *
+     * Triggers FULL_EXIT when an opposing signal appears — interpreted as a
+     * market reversal. Score comparison is intentionally omitted: signals reach
+     * 'pending' status only after passing SignalRankerService minimum_signal_score
+     * filter. Any surviving pending opposite signal is a valid reversal indicator.
+     *
+     * Note: Signal.score is not a persistent DB column — it is a runtime key
+     * added by SignalRankerService::rank() via array_merge(). Score-based
+     * comparison requires persisting score to signals table (Sprint 4 item).
      */
     private function hasOppositeSignal(PaperTrade $trade): bool
     {
-        $currentSignal = $trade->signal;
-        $currentScore  = $currentSignal ? (float) ($currentSignal->score ?? 0) : 0;
-
         $oppositeDirection = strtolower((string) $trade->direction) === 'yes' ? 'no' : 'yes';
 
         return Signal::where('market_id', $trade->market_id)
@@ -11880,12 +11893,10 @@ function buildEventHtml(ev) {
                     <dt class="col-5 text-muted small">Fees</dt>
                     <dd class="col-7 text-muted">${{ number_format($paperTrade->fees_usd, 4) }}</dd>
 
-                    @if($paperTrade->signal)
+                    @if($paperTrade->signal_score !== null)
                     <dt class="col-5 text-muted small">Signal Score</dt>
                     <dd class="col-7">
-                        {{ $paperTrade->signal->confidence_at_signal
-                            ? round((float)$paperTrade->signal->confidence_at_signal * 100, 1) . '%'
-                            : 'N/A' }}
+                        {{ round((float)$paperTrade->signal_score * 100, 1) . '%' }}
                     </dd>
                     @endif
 
@@ -13100,7 +13111,6 @@ Route::middleware('auth')->group(function () {
 
 === FILE: ./laravel/routes/console.php ===
 <?php
-
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Schedule;
 use App\Jobs\ProcessSignalCycleJob;
@@ -13110,21 +13120,17 @@ Artisan::command('inspire', function () {
     $this->comment(\Illuminate\Foundation\Inspiring::quote());
 })->purpose('Display an inspiring quote');
 
-// Process pending signals → open paper trades
-// Runs every 5 minutes, aligned with Python signal generation
-Schedule::command('trade:process-signals')
-    ->everyFiveMinutes()
-    ->withoutOverlapping()
-    ->runInBackground();
+// trade:process-signals DISABLED — digantikan oleh ProcessSignalCycleJob
+// PaperTradingService lama tidak memiliki score filter dan max concurrent guard
+// Schedule::command('trade:process-signals')->everyFiveMinutes()->withoutOverlapping()->runInBackground();
 
 // Auto-close resolved trades + update unrealized PnL
-// Runs every 5 minutes
 Schedule::command('trade:auto-close')
     ->everyFiveMinutes()
     ->withoutOverlapping()
     ->runInBackground();
 
-// Process signal cycles (e.g. check for cycle completion, update statuses, etc.)
+// Pipeline baru — score filter + max concurrent + position sizing
 Schedule::job(new ProcessSignalCycleJob())->everyFiveMinutes();
 Schedule::job(new SmartExitMonitorJob())->everyMinute()->withoutOverlapping();
 

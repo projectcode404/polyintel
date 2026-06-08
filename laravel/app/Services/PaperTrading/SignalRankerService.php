@@ -122,9 +122,9 @@ final class SignalRankerService
 
         // Raw metrics → normalized scores
         // NULL = old signal without metrics → score 0 (no exception)
-        $momentumScore  = $this->normalizeMomentum($signal['momentum_24h_percent'] ?? null);
-        $liquidityScore = $this->normalizeLiquidity($signal['liquidity_usd']       ?? null);
-        $volumeScore    = $this->normalizeVolume($signal['volume_24h_usd']         ?? null);
+        $momentumScore  = $this->normalizeMomentum(isset($signal['momentum_24h_percent']) ? (float) $signal['momentum_24h_percent'] : null);
+        $liquidityScore = $this->normalizeLiquidity(isset($signal['liquidity_usd']) ? (float) $signal['liquidity_usd'] : null);
+        $volumeScore    = $this->normalizeVolume(isset($signal['volume_24h_usd']) ? (float) $signal['volume_24h_usd'] : null);
 
         // Weighted sum
         $score = (self::WEIGHT_EDGE       * $edgeScore)
@@ -134,7 +134,7 @@ final class SignalRankerService
                + (self::WEIGHT_VOLUME     * $volumeScore);
 
         // Apply spread penalty
-        $score = $this->applySpreadPenalty($score, $signal['spread'] ?? null);
+        $score = $this->applySpreadPenalty($score, isset($signal['spread']) ? (float) $signal['spread'] : null);
 
         return round($this->clamp($score), 4);
     }

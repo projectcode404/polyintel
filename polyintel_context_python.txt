@@ -3722,6 +3722,34 @@ class Signal(Base):
         comment="Copied from market_outcomes.resolved_at — actual market resolution time.",
     )
 
+    # -------------------------------------------------------------------------
+    # Sprint 4 — Raw market metrics at signal time
+    # Diisi oleh signal_repository.py dari EdgeCalculator context.
+    # Digunakan oleh SignalRankerService untuk composite score.
+    # Semua nullable: signal lama sebelum Sprint 4 tidak punya nilai ini.
+    # -------------------------------------------------------------------------
+
+    momentum_24h_percent: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(10, 6),
+        nullable=True,
+        comment="24h probability momentum percent at signal time",
+    )
+    liquidity_usd: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(20, 2),
+        nullable=True,
+        comment="Market liquidity (USD) from snapshot at signal time",
+    )
+    volume_24h_usd: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(20, 2),
+        nullable=True,
+        comment="24h trading volume (USD) at signal time",
+    )
+    spread: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(8, 6),
+        nullable=True,
+        comment="Bid-ask spread at signal time",
+    )
+
     # --- Timestamps ---
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -4626,7 +4654,8 @@ class SignalRepository:
                     expires_at=now + timedelta(hours=24),
                     momentum_24h_percent=s_data["context"].get("momentum"),
                     volume_24h_usd=s_data["context"].get("volume_24h"),
-                    liquidity_usd=s_data["context"].get("volume_7d"),
+                    liquidity_usd=s_data["context"].get("liquidity"),
+                    spread=s_data["context"].get("spread"),
                 )
                 
                 session.add(new_signal)
@@ -5431,6 +5460,9 @@ class EdgeCalculator:
                            if daily_stat and daily_stat.volume_7d_avg_usd else None,
             "momentum":    float(daily_stat.momentum_24h_percent)
                            if daily_stat and daily_stat.momentum_24h_percent else None,
+            "liquidity":   float(latest_snapshot.liquidity_usd),
+            "spread":      float(latest_snapshot.spread)
+                           if latest_snapshot.spread is not None else None,
             "confidence":  0.8,
         }
 

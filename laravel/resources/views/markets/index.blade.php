@@ -146,9 +146,11 @@ document.addEventListener('DOMContentLoaded', function () {
     const gridOptions = {
         columnDefs,
         rowModelType: 'infinite',
-        cacheBlockSize: 100,
+        cacheBlockSize: 50,
         maxBlocksInCache: 10,
-        infiniteInitialRowCount: 100,
+        infiniteInitialRowCount: 50,
+        pagination: true,
+        paginationPageSize: 50,
         defaultColDef: {
             sortable:    true,
             resizable:   true,
@@ -204,7 +206,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // ---- Filter change handlers ----
     ['filterStatus', 'filterSubCategory'].forEach(id => {
         document.getElementById(id).addEventListener('change', () => {
-            grid.api?.purgeInfiniteCache();
+            grid.api?.refreshInfiniteCache();
         });
     });
 });
