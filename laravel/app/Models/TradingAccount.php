@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use App\Models\PaperTradeSetting;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
 /**
@@ -25,6 +26,7 @@ final class TradingAccount extends Model
         'balance',
         'is_auto_trade',
         'is_auto_close',
+        'paper_trade_setting_id',
     ];
 
     protected $casts = [
@@ -45,5 +47,10 @@ final class TradingAccount extends Model
     public function paperTrades(): HasMany
     {
         return $this->hasMany(PaperTrade::class);
+    }
+
+    public function settings(): BelongsTo
+    {
+        return $this->belongsTo(PaperTradeSetting::class, 'paper_trade_setting_id');
     }
 }

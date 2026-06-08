@@ -6,21 +6,24 @@ namespace App\Http\Controllers;
 
 use App\Http\Requests\UpdatePaperTradeSettingsRequest;
 use App\Models\PaperTradeSetting;
-use Illuminate\Http\RedirectResponse;
+use App\Services\PortfolioService;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\View\View;
 
 final class PaperTradeSettingsController extends Controller
 {
     public function index(): View
     {
-        $settings = PaperTradeSetting::current();
+        $account  = app(PortfolioService::class)->getAccountForUser(Auth::user());
+        $settings = $account->settings ?? PaperTradeSetting::current();
 
         return view('paper-trades.settings', compact('settings'));
     }
 
     public function update(UpdatePaperTradeSettingsRequest $request): RedirectResponse
     {
-        $settings = PaperTradeSetting::current();
+        $account  = app(PortfolioService::class)->getAccountForUser(Auth::user());
+        $settings = $account->settings ?? PaperTradeSetting::current();
 
         // If a named preset was requested via preset-button, delegate to applyPreset()
         // which overwrites all strategy fields. The hidden input name is "apply_preset".

@@ -40,12 +40,12 @@ final class PortfolioMetricsService
      *   closed_trades_count: int,
      * }
      */
-    public function getPortfolioState(PaperTradeSetting $settings): array
+    public function getPortfolioState(PaperTradeSetting $settings, int $accountId = 0): array
     {
         $initialCapital = (float) $settings->initial_capital;
-        $realizedPnl    = $this->getRealizedPnl();
-        $unrealizedPnl  = $this->getUnrealizedPnl();
-        $allocatedCap   = $this->getAllocatedCapital();
+        $realizedPnl    = $this->getRealizedPnl($accountId);
+        $unrealizedPnl  = $this->getUnrealizedPnl($accountId);
+        $allocatedCap   = $this->getAllocatedCapital($accountId);
 
         $currentEquity = $initialCapital + $realizedPnl + $unrealizedPnl;
         $cashBalance   = $initialCapital + $realizedPnl - $allocatedCap;
@@ -61,8 +61,8 @@ final class PortfolioMetricsService
             'allocated_capital'   => $allocatedCap,
             'cash_balance'        => $cashBalance,
             'exposure_percent'    => $exposurePct,
-            'open_trades_count'   => $this->getOpenTradesCount(),
-            'closed_trades_count' => $this->getClosedTradesCount(),
+            'open_trades_count'   => $this->getOpenTradesCount($accountId),
+            'closed_trades_count' => $this->getClosedTradesCount($accountId),
         ];
     }
 
@@ -73,10 +73,11 @@ final class PortfolioMetricsService
     /**
      * Sum of pnl_usd from all closed/resolved trades.
      */
-    public function getRealizedPnl(): float
+    public function getRealizedPnl(int $accountId = 0): float
     {
-        return (float) PaperTrade::whereIn('status', PaperTrade::CLOSED_STATUSES)
-            ->sum('pnl_usd');
+        $q = PaperTrade::whereIn('status', PaperTrade::CLOSED_STATUSES);
+        if ($accountId > 0) $q->where('trading_account_id', $accountId);
+        return (float) $q->sum('pnl_usd');
     }
 
     /**
@@ -88,10 +89,11 @@ final class PortfolioMetricsService
      * close tracking is implemented. This is intentionally conservative.
      * When current_price is NULL, falls back to entry_price (unrealized = 0).
      */
-    public function getUnrealizedPnl(): float
+    public function getUnrealizedPnl(int $accountId = 0): float
     {
-        $result = PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES)
-            ->selectRaw('
+        $q = PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES);
+        if ($accountId > 0) $q->where('trading_account_id', $accountId);
+        $result = $q->selectRaw('
                 COALESCE(
                     SUM(
                         (COALESCE(current_price, entry_price) - entry_price) * shares
@@ -109,20 +111,25 @@ final class PortfolioMetricsService
      * Uses position_size_usd as the definitive allocated amount.
      * This is the actual USD deployed, not entry_price * shares.
      */
-    public function getAllocatedCapital(): float
+    public function getAllocatedCapital(int $accountId = 0): float
     {
-        return (float) PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES)
-            ->sum('position_size_usd');
+        $q = PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES);
+        if ($accountId > 0) $q->where('trading_account_id', $accountId);
+        return (float) $q->sum('position_size_usd');
     }
 
-    public function getOpenTradesCount(): int
+    public function getOpenTradesCount(int $accountId = 0): int
     {
-        return PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES)->count();
+        $q = PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES);
+        if ($accountId > 0) $q->where('trading_account_id', $accountId);
+        return $q->count();
     }
 
-    public function getClosedTradesCount(): int
+    public function getClosedTradesCount(int $accountId = 0): int
     {
-        return PaperTrade::whereIn('status', PaperTrade::CLOSED_STATUSES)->count();
+        $q = PaperTrade::whereIn('status', PaperTrade::CLOSED_STATUSES);
+        if ($accountId > 0) $q->where('trading_account_id', $accountId);
+        return $q->count();
     }
 
     // =========================================================================

@@ -56,8 +56,8 @@ final class PortfolioManagerService
      */
     public function processCycle(Collection $signals, TradingAccount $account): array
     {
-        $settings = PaperTradeSetting::current();
-        $state    = $this->metricsService->getPortfolioState($settings);
+        $settings = $account->settings ?? PaperTradeSetting::current();
+        $state    = $this->metricsService->getPortfolioState($settings, $account->id);
         $results  = ['opened' => 0, 'skipped' => 0, 'reasons' => []];
 
         Log::info('[PortfolioManager] Cycle started', [
@@ -75,7 +75,7 @@ final class PortfolioManagerService
         ]);
 
         // Step 2: Apply market constraints (cooldown + duplicate market check)
-        $eligible = $this->rankerService->applyMarketConstraints($ranked, $settings);
+        $eligible = $this->rankerService->applyMarketConstraints($ranked, $settings, $account);
 
         Log::info('[PortfolioManager] After market constraints', [
             'eligible_count' => $eligible->count(),
@@ -88,7 +88,7 @@ final class PortfolioManagerService
             if ($outcome['opened']) {
                 $results['opened']++;
                 // Recalculate state so subsequent signals see updated exposure
-                $state = $this->metricsService->getPortfolioState($settings);
+                $state = $this->metricsService->getPortfolioState($settings, $account->id);
             } else {
                 $results['skipped']++;
                 $results['reasons'][] = [

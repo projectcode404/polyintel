@@ -150,11 +150,11 @@ final class SignalRankerService
      */
     public function applyMarketConstraints(
         Collection $signals,
-        PaperTradeSetting $settings
+        PaperTradeSetting $settings,
+        \App\Models\TradingAccount $account
     ): Collection {
-        $openMarketCounts  = $this->getOpenTradeMarketCounts();
-        $cooldownMarketIds = $this->getCooldownMarketIds((int) $settings->market_cooldown_minutes);
-
+        $openMarketCounts  = $this->getOpenTradeMarketCounts($account->id);
+        $cooldownMarketIds = $this->getCooldownMarketIds((int) $settings->market_cooldown_minutes, $account->id);
         return $signals->filter(function ($signal) use ($openMarketCounts, $cooldownMarketIds, $settings) {
             $marketId = $signal['market_id'] ?? null;
 
@@ -269,9 +269,10 @@ final class SignalRankerService
     /**
      * Returns map of market_id => open trade count.
      */
-    private function getOpenTradeMarketCounts(): Collection
+    private function getOpenTradeMarketCounts(int $accountId): Collection
     {
         return PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES)
+            ->where('trading_account_id', $accountId)
             ->select('market_id', DB::raw('COUNT(*) as cnt'))
             ->groupBy('market_id')
             ->pluck('cnt', 'market_id');
@@ -280,9 +281,10 @@ final class SignalRankerService
     /**
      * Returns Collection of market_ids stopped within cooldown window.
      */
-    private function getCooldownMarketIds(int $cooldownMinutes): Collection
+    private function getCooldownMarketIds(int $cooldownMinutes, int $accountId): Collection
     {
         return PaperTrade::where('status', PaperTrade::STATUS_STOPPED)
+            ->where('trading_account_id', $accountId)
             ->where('updated_at', '>=', now()->subMinutes($cooldownMinutes))
             ->pluck('market_id');
     }
