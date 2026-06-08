@@ -31,7 +31,7 @@ final class PortfolioDashboardService
      */
     public function getOverviewCards(TradingAccount $account): array
     {
-        $settings       = PaperTradeSetting::current();
+        $settings       = $account->settings ?? PaperTradeSetting::current();
         $initialCapital = (float) $settings->initial_capital;
 
         $openTrades   = $this->getOpenTrades($account);
@@ -41,16 +41,16 @@ final class PortfolioDashboardService
         $unrealizedPnl     = $openTrades->sum('unrealized_pnl_usd');
         $realizedPnl       = $closedTrades->sum('pnl_usd');
 
-        $currentBalance = (float) $account->balance;
-        $currentEquity  = $currentBalance + $unrealizedPnl;
+        $currentBalance = $initialCapital + $realizedPnl - $totalPositionSize;
+        $currentEquity  = $initialCapital + $realizedPnl + $unrealizedPnl;
         $totalPnl       = $realizedPnl + $unrealizedPnl;
 
-        // Portfolio value = cash + open positions at current price
-        $portfolioValue = $currentBalance + $totalPositionSize;
+        // Portfolio value = initial capital + total PnL (realized + unrealized)
+        $portfolioValue = $currentEquity;
 
-        // Exposure = allocated capital / initial capital
-        $exposurePercent = $initialCapital > 0
-            ? ($totalPositionSize / $initialCapital) * 100
+        // Exposure = allocated capital / current equity
+        $exposurePercent = $currentEquity > 0
+            ? ($totalPositionSize / $currentEquity) * 100
             : 0.0;
 
         // ROI = total PnL / initial capital

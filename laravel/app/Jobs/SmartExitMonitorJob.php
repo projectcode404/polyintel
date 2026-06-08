@@ -182,11 +182,13 @@ final class SmartExitMonitorJob implements ShouldQueue
                 'exit_reason'         => $eventType,
                 'smart_exit_reason'   => $isSmart ? $reason : null,
                 'holding_period_hours'=> $trade->holdingHours(),
+                'holding_period_hours'=> $trade->holdingHours(),
                 'exited_at'           => now(),
+                'outcome'             => $totalPnl >= 0 ? 'win' : 'loss',
             ]);
         });
-    }
 
+    }
     // -------------------------------------------------------------------------
 
     private function executePartialExit(
@@ -261,7 +263,8 @@ final class SmartExitMonitorJob implements ShouldQueue
                 ...($newStatus !== PaperTrade::STATUS_PARTIAL ? [
                     'exit_price'           => $currentPrice,
                     'holding_period_hours' => $trade->holdingHours(),
-                    'exited_at'            => now(),
+                    'outcome'              => $totalPnl >= 0 ? 'win' : 'loss',
+                    'exit_price'           => $currentPrice,
                 ] : []),
             ]);
         });
@@ -302,12 +305,8 @@ final class SmartExitMonitorJob implements ShouldQueue
     {
         $snapshot = $trade->market?->snapshots()?->latest()->first();
 
-        if ($snapshot && isset($snapshot->best_ask) && (float) $snapshot->best_ask > 0) {
-            return (float) $snapshot->best_ask;
-        }
-
-        if ($snapshot && isset($snapshot->price) && (float) $snapshot->price > 0) {
-            return (float) $snapshot->price;
+        if ($snapshot && (float) $snapshot->probability_yes > 0) {
+            return (float) $snapshot->probability_yes;
         }
 
         return (float) ($trade->current_price ?? 0);
