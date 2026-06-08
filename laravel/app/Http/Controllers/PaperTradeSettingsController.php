@@ -7,6 +7,7 @@ namespace App\Http\Controllers;
 use App\Http\Requests\UpdatePaperTradeSettingsRequest;
 use App\Models\PaperTradeSetting;
 use App\Services\PortfolioService;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\View\View;
 

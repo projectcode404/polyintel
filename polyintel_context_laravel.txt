@@ -883,7 +883,7 @@ final class PaperTradeDashboardController extends Controller
 
         $overview       = $this->dashboardService->getOverviewCards($account);
         $equityCurve    = $this->equityCurveService->getDailyEquityCurve($account);
-        $equitySummary  = $this->equityCurveService->getEquitySummary($account);
+        $equitySummary  = $this->equityCurveService->getEquitySummary($account, $equityCurve);
         $smartExitStats = $this->dashboardService->getSmartExitStats($account);
         $performance    = $this->analyticsService->getFullMetrics($account);
         $recentActivity = $this->dashboardService->getRecentActivity($account, 20);
@@ -1058,21 +1058,25 @@ namespace App\Http\Controllers;
 
 use App\Http\Requests\UpdatePaperTradeSettingsRequest;
 use App\Models\PaperTradeSetting;
+use App\Services\PortfolioService;
 use Illuminate\Http\RedirectResponse;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\View\View;
 
 final class PaperTradeSettingsController extends Controller
 {
     public function index(): View
     {
-        $settings = PaperTradeSetting::current();
+        $account  = app(PortfolioService::class)->getAccountForUser(Auth::user());
+        $settings = $account->settings ?? PaperTradeSetting::current();
 
         return view('paper-trades.settings', compact('settings'));
     }
 
     public function update(UpdatePaperTradeSettingsRequest $request): RedirectResponse
     {
-        $settings = PaperTradeSetting::current();
+        $account  = app(PortfolioService::class)->getAccountForUser(Auth::user());
+        $settings = $account->settings ?? PaperTradeSetting::current();
 
         // If a named preset was requested via preset-button, delegate to applyPreset()
         // which overwrites all strategy fields. The hidden input name is "apply_preset".
@@ -1808,11 +1812,13 @@ final class SmartExitMonitorJob implements ShouldQueue
                 'exit_reason'         => $eventType,
                 'smart_exit_reason'   => $isSmart ? $reason : null,
                 'holding_period_hours'=> $trade->holdingHours(),
+                'holding_period_hours'=> $trade->holdingHours(),
                 'exited_at'           => now(),
+                'outcome'             => $totalPnl >= 0 ? 'win' : 'loss',
             ]);
         });
-    }
 
+    }
     // -------------------------------------------------------------------------
 
     private function executePartialExit(
@@ -1887,7 +1893,8 @@ final class SmartExitMonitorJob implements ShouldQueue
                 ...($newStatus !== PaperTrade::STATUS_PARTIAL ? [
                     'exit_price'           => $currentPrice,
                     'holding_period_hours' => $trade->holdingHours(),
-                    'exited_at'            => now(),
+                    'outcome'              => $totalPnl >= 0 ? 'win' : 'loss',
+                    'exit_price'           => $currentPrice,
                 ] : []),
             ]);
         });
@@ -1928,12 +1935,8 @@ final class SmartExitMonitorJob implements ShouldQueue
     {
         $snapshot = $trade->market?->snapshots()?->latest()->first();
 
-        if ($snapshot && isset($snapshot->best_ask) && (float) $snapshot->best_ask > 0) {
-            return (float) $snapshot->best_ask;
-        }
-
-        if ($snapshot && isset($snapshot->price) && (float) $snapshot->price > 0) {
-            return (float) $snapshot->price;
+        if ($snapshot && (float) $snapshot->probability_yes > 0) {
+            return (float) $snapshot->probability_yes;
         }
 
         return (float) ($trade->current_price ?? 0);
@@ -3250,6 +3253,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use App\Models\PaperTradeSetting;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
 /**
@@ -3267,6 +3271,7 @@ final class TradingAccount extends Model
         'balance',
         'is_auto_trade',
         'is_auto_close',
+        'paper_trade_setting_id',
     ];
 
     protected $casts = [
@@ -3287,6 +3292,11 @@ final class TradingAccount extends Model
     public function paperTrades(): HasMany
     {
         return $this->hasMany(PaperTrade::class);
+    }
+
+    public function settings(): BelongsTo
+    {
+        return $this->belongsTo(PaperTradeSetting::class, 'paper_trade_setting_id');
     }
 }
 
@@ -3962,9 +3972,9 @@ final class EquityCurveService
      * Statistik ringkas dari equity curve.
      * Digunakan untuk stat cards di atas chart.
      */
-    public function getEquitySummary(TradingAccount $account): array
+    public function getEquitySummary(TradingAccount $account, ?array $curve = null): array
     {
-        $curve = $this->getEquityCurve($account);
+        $curve = $curve ?? $this->getEquityCurve($account);
 
         $equityPoints = $curve['equity'];
         $baseline     = $curve['baseline'];
@@ -4503,7 +4513,7 @@ final class PortfolioDashboardService
      */
     public function getOverviewCards(TradingAccount $account): array
     {
-        $settings       = PaperTradeSetting::current();
+        $settings       = $account->settings ?? PaperTradeSetting::current();
         $initialCapital = (float) $settings->initial_capital;
 
         $openTrades   = $this->getOpenTrades($account);
@@ -4513,16 +4523,16 @@ final class PortfolioDashboardService
         $unrealizedPnl     = $openTrades->sum('unrealized_pnl_usd');
         $realizedPnl       = $closedTrades->sum('pnl_usd');
 
-        $currentBalance = (float) $account->balance;
-        $currentEquity  = $currentBalance + $unrealizedPnl;
+        $currentBalance = $initialCapital + $realizedPnl - $totalPositionSize;
+        $currentEquity  = $initialCapital + $realizedPnl + $unrealizedPnl;
         $totalPnl       = $realizedPnl + $unrealizedPnl;
 
-        // Portfolio value = cash + open positions at current price
-        $portfolioValue = $currentBalance + $totalPositionSize;
+        // Portfolio value = initial capital + total PnL (realized + unrealized)
+        $portfolioValue = $currentEquity;
 
-        // Exposure = allocated capital / initial capital
-        $exposurePercent = $initialCapital > 0
-            ? ($totalPositionSize / $initialCapital) * 100
+        // Exposure = allocated capital / current equity
+        $exposurePercent = $currentEquity > 0
+            ? ($totalPositionSize / $currentEquity) * 100
             : 0.0;
 
         // ROI = total PnL / initial capital
@@ -4531,10 +4541,13 @@ final class PortfolioDashboardService
             : 0.0;
 
         // Win rate dari closed trades
-        $winCount  = $closedTrades->where('outcome', 'win')->count();
-        $lossCount = $closedTrades->where('outcome', 'loss')->count();
+        $winCount    = $closedTrades->where('outcome', 'win')->count();
+        $lossCount   = $closedTrades->where('outcome', 'loss')->count();
         $totalClosed = $closedTrades->count();
-        $winRate   = $totalClosed > 0 ? ($winCount / $totalClosed) * 100 : 0.0;
+        // Hanya hitung trade yang outcome definitif (win/loss).
+        // Exclude NULL, breakeven, cancelled agar win rate tidak terdilusi.
+        $ratedCount  = $winCount + $lossCount;
+        $winRate     = $ratedCount > 0 ? ($winCount / $ratedCount) * 100 : 0.0;
 
         // Profit factor
         $grossProfit = $closedTrades->where('pnl_usd', '>', 0)->sum('pnl_usd');
@@ -4964,8 +4977,8 @@ final class PortfolioManagerService
      */
     public function processCycle(Collection $signals, TradingAccount $account): array
     {
-        $settings = PaperTradeSetting::current();
-        $state    = $this->metricsService->getPortfolioState($settings);
+        $settings = $account->settings ?? PaperTradeSetting::current();
+        $state    = $this->metricsService->getPortfolioState($settings, $account->id);
         $results  = ['opened' => 0, 'skipped' => 0, 'reasons' => []];
 
         Log::info('[PortfolioManager] Cycle started', [
@@ -4983,7 +4996,7 @@ final class PortfolioManagerService
         ]);
 
         // Step 2: Apply market constraints (cooldown + duplicate market check)
-        $eligible = $this->rankerService->applyMarketConstraints($ranked, $settings);
+        $eligible = $this->rankerService->applyMarketConstraints($ranked, $settings, $account);
 
         Log::info('[PortfolioManager] After market constraints', [
             'eligible_count' => $eligible->count(),
@@ -4996,7 +5009,7 @@ final class PortfolioManagerService
             if ($outcome['opened']) {
                 $results['opened']++;
                 // Recalculate state so subsequent signals see updated exposure
-                $state = $this->metricsService->getPortfolioState($settings);
+                $state = $this->metricsService->getPortfolioState($settings, $account->id);
             } else {
                 $results['skipped']++;
                 $results['reasons'][] = [
@@ -5082,7 +5095,7 @@ final class PortfolioManagerService
 
         // Open trade in atomic transaction
         try {
-            DB::transaction(function () use ($signal, $settings, $entryPrice, $positionSize, $shares, $exitLevels) {
+            DB::transaction(function () use ($signal, $settings, $entryPrice, $positionSize, $shares, $exitLevels, $account) {
                 $trade = PaperTrade::create([
                     'trading_account_id'           => $account->id,
                     'market_id'                    => $signal['market_id'],
@@ -5190,12 +5203,12 @@ final class PortfolioMetricsService
      *   closed_trades_count: int,
      * }
      */
-    public function getPortfolioState(PaperTradeSetting $settings): array
+    public function getPortfolioState(PaperTradeSetting $settings, int $accountId = 0): array
     {
         $initialCapital = (float) $settings->initial_capital;
-        $realizedPnl    = $this->getRealizedPnl();
-        $unrealizedPnl  = $this->getUnrealizedPnl();
-        $allocatedCap   = $this->getAllocatedCapital();
+        $realizedPnl    = $this->getRealizedPnl($accountId);
+        $unrealizedPnl  = $this->getUnrealizedPnl($accountId);
+        $allocatedCap   = $this->getAllocatedCapital($accountId);
 
         $currentEquity = $initialCapital + $realizedPnl + $unrealizedPnl;
         $cashBalance   = $initialCapital + $realizedPnl - $allocatedCap;
@@ -5211,8 +5224,8 @@ final class PortfolioMetricsService
             'allocated_capital'   => $allocatedCap,
             'cash_balance'        => $cashBalance,
             'exposure_percent'    => $exposurePct,
-            'open_trades_count'   => $this->getOpenTradesCount(),
-            'closed_trades_count' => $this->getClosedTradesCount(),
+            'open_trades_count'   => $this->getOpenTradesCount($accountId),
+            'closed_trades_count' => $this->getClosedTradesCount($accountId),
         ];
     }
 
@@ -5223,10 +5236,11 @@ final class PortfolioMetricsService
     /**
      * Sum of pnl_usd from all closed/resolved trades.
      */
-    public function getRealizedPnl(): float
+    public function getRealizedPnl(int $accountId = 0): float
     {
-        return (float) PaperTrade::whereIn('status', PaperTrade::CLOSED_STATUSES)
-            ->sum('pnl_usd');
+        $q = PaperTrade::whereIn('status', PaperTrade::CLOSED_STATUSES);
+        if ($accountId > 0) $q->where('trading_account_id', $accountId);
+        return (float) $q->sum('pnl_usd');
     }
 
     /**
@@ -5238,10 +5252,11 @@ final class PortfolioMetricsService
      * close tracking is implemented. This is intentionally conservative.
      * When current_price is NULL, falls back to entry_price (unrealized = 0).
      */
-    public function getUnrealizedPnl(): float
+    public function getUnrealizedPnl(int $accountId = 0): float
     {
-        $result = PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES)
-            ->selectRaw('
+        $q = PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES);
+        if ($accountId > 0) $q->where('trading_account_id', $accountId);
+        $result = $q->selectRaw('
                 COALESCE(
                     SUM(
                         (COALESCE(current_price, entry_price) - entry_price) * shares
@@ -5259,20 +5274,25 @@ final class PortfolioMetricsService
      * Uses position_size_usd as the definitive allocated amount.
      * This is the actual USD deployed, not entry_price * shares.
      */
-    public function getAllocatedCapital(): float
+    public function getAllocatedCapital(int $accountId = 0): float
     {
-        return (float) PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES)
-            ->sum('position_size_usd');
+        $q = PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES);
+        if ($accountId > 0) $q->where('trading_account_id', $accountId);
+        return (float) $q->sum('position_size_usd');
     }
 
-    public function getOpenTradesCount(): int
+    public function getOpenTradesCount(int $accountId = 0): int
     {
-        return PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES)->count();
+        $q = PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES);
+        if ($accountId > 0) $q->where('trading_account_id', $accountId);
+        return $q->count();
     }
 
-    public function getClosedTradesCount(): int
+    public function getClosedTradesCount(int $accountId = 0): int
     {
-        return PaperTrade::whereIn('status', PaperTrade::CLOSED_STATUSES)->count();
+        $q = PaperTrade::whereIn('status', PaperTrade::CLOSED_STATUSES);
+        if ($accountId > 0) $q->where('trading_account_id', $accountId);
+        return $q->count();
     }
 
     // =========================================================================
@@ -5648,9 +5668,9 @@ final class SignalRankerService
 
         // Raw metrics → normalized scores
         // NULL = old signal without metrics → score 0 (no exception)
-        $momentumScore  = $this->normalizeMomentum($signal['momentum_24h_percent'] ?? null);
-        $liquidityScore = $this->normalizeLiquidity($signal['liquidity_usd']       ?? null);
-        $volumeScore    = $this->normalizeVolume($signal['volume_24h_usd']         ?? null);
+        $momentumScore  = $this->normalizeMomentum(isset($signal['momentum_24h_percent']) ? (float) $signal['momentum_24h_percent'] : null);
+        $liquidityScore = $this->normalizeLiquidity(isset($signal['liquidity_usd']) ? (float) $signal['liquidity_usd'] : null);
+        $volumeScore    = $this->normalizeVolume(isset($signal['volume_24h_usd']) ? (float) $signal['volume_24h_usd'] : null);
 
         // Weighted sum
         $score = (self::WEIGHT_EDGE       * $edgeScore)
@@ -5660,7 +5680,7 @@ final class SignalRankerService
                + (self::WEIGHT_VOLUME     * $volumeScore);
 
         // Apply spread penalty
-        $score = $this->applySpreadPenalty($score, $signal['spread'] ?? null);
+        $score = $this->applySpreadPenalty($score, isset($signal['spread']) ? (float) $signal['spread'] : null);
 
         return round($this->clamp($score), 4);
     }
@@ -5676,11 +5696,11 @@ final class SignalRankerService
      */
     public function applyMarketConstraints(
         Collection $signals,
-        PaperTradeSetting $settings
+        PaperTradeSetting $settings,
+        \App\Models\TradingAccount $account
     ): Collection {
-        $openMarketCounts  = $this->getOpenTradeMarketCounts();
-        $cooldownMarketIds = $this->getCooldownMarketIds((int) $settings->market_cooldown_minutes);
-
+        $openMarketCounts  = $this->getOpenTradeMarketCounts($account->id);
+        $cooldownMarketIds = $this->getCooldownMarketIds((int) $settings->market_cooldown_minutes, $account->id);
         return $signals->filter(function ($signal) use ($openMarketCounts, $cooldownMarketIds, $settings) {
             $marketId = $signal['market_id'] ?? null;
 
@@ -5795,9 +5815,10 @@ final class SignalRankerService
     /**
      * Returns map of market_id => open trade count.
      */
-    private function getOpenTradeMarketCounts(): Collection
+    private function getOpenTradeMarketCounts(int $accountId): Collection
     {
         return PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES)
+            ->where('trading_account_id', $accountId)
             ->select('market_id', DB::raw('COUNT(*) as cnt'))
             ->groupBy('market_id')
             ->pluck('cnt', 'market_id');
@@ -5806,9 +5827,10 @@ final class SignalRankerService
     /**
      * Returns Collection of market_ids stopped within cooldown window.
      */
-    private function getCooldownMarketIds(int $cooldownMinutes): Collection
+    private function getCooldownMarketIds(int $cooldownMinutes, int $accountId): Collection
     {
         return PaperTrade::where('status', PaperTrade::STATUS_STOPPED)
+            ->where('trading_account_id', $accountId)
             ->where('updated_at', '>=', now()->subMinutes($cooldownMinutes))
             ->pluck('market_id');
     }
@@ -5818,6 +5840,7 @@ final class SignalRankerService
         return max($min, min($max, $value));
     }
 }
+
 === FILE: ./laravel/app/Services/PaperTrading/SmartExitDecision.php ===
 <?php
 
@@ -6376,6 +6399,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Models\PaperTradeSetting;
 use App\Models\SystemSetting;
 use App\Models\TradingAccount;
 use App\Models\User;
@@ -6388,14 +6412,51 @@ final class PortfolioService
      */
     public function getAccountForUser(User $user): TradingAccount
     {
-        return TradingAccount::firstOrCreate(
+        $account = TradingAccount::firstOrCreate(
             ['user_id' => $user->id],
             [
-                'balance' => 1000.0,
+                'balance'       => 1000.0,
                 'is_auto_trade' => false,
                 'is_auto_close' => false,
             ]
         );
+
+        if (! $account->paper_trade_setting_id) {
+            $settings = PaperTradeSetting::firstOrCreate(
+                ['user_id' => $user->id],
+                [
+                    'initial_capital'                => 1000.0,
+                    'max_portfolio_exposure_percent' => 80.0,
+                    'max_concurrent_trades'          => 20,
+                    'reserve_cash_percent'           => 20.0,
+                    'max_position_per_market'        => 1,
+                    'market_cooldown_minutes'        => 60,
+                    'position_size_mode'             => 'fixed_percent',
+                    'fixed_percent'                  => 5.0,
+                    'enable_dynamic_position_size'   => false,
+                    'enable_top_signal_filter'       => true,
+                    'max_signals_per_cycle'          => 10,
+                    'minimum_signal_score'           => 0.2,
+                    'enable_take_profit'             => true,
+                    'take_profit_mode'               => 'r_multiple',
+                    'take_profit_r1'                 => 1.0,
+                    'enable_stop_loss'               => true,
+                    'stop_loss_mode'                 => 'r_multiple',
+                    'stop_loss_value'                => 1.0,
+                    'enable_move_to_breakeven'       => true,
+                    'breakeven_trigger_r'            => 1.0,
+                    'enable_partial_take_profit'     => false,
+                    'partial_tp1_percent'            => 50.0,
+                    'partial_tp2_percent'            => 30.0,
+                    'partial_tp3_percent'            => 20.0,
+                    'enable_smart_exit'              => true,
+                    'preset'                         => 'balanced',
+                ]
+            );
+            $account->update(['paper_trade_setting_id' => $settings->id]);
+        }
+
+        return $account->refresh();
     }
 
     /**
@@ -8112,6 +8173,67 @@ return new class extends Migration
     }
 };
 
+=== FILE: ./laravel/database/migrations/2026_06_08_000001_add_user_settings_to_paper_trading.php ===
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        // 1. Tambah user_id ke paper_trade_settings
+        Schema::table('paper_trade_settings', function (Blueprint $table) {
+            $table->foreignId('user_id')
+                  ->nullable()
+                  ->after('id')
+                  ->constrained('users')
+                  ->onDelete('cascade');
+        });
+
+        // 2. Tambah paper_trade_setting_id ke trading_accounts
+        Schema::table('trading_accounts', function (Blueprint $table) {
+            $table->foreignId('paper_trade_setting_id')
+                  ->nullable()
+                  ->after('user_id')
+                  ->constrained('paper_trade_settings')
+                  ->onDelete('set null');
+        });
+
+        // 3. Assign existing settings (id=1) ke semua existing trading accounts
+        $settingId = DB::table('paper_trade_settings')->value('id');
+        if ($settingId) {
+            DB::table('trading_accounts')->update([
+                'paper_trade_setting_id' => $settingId,
+            ]);
+        }
+
+        // 4. Assign existing trading accounts user_id ke settings
+        $accounts = DB::table('trading_accounts')->get();
+        foreach ($accounts as $account) {
+            DB::table('paper_trade_settings')
+                ->where('id', $account->paper_trade_setting_id)
+                ->update(['user_id' => $account->user_id]);
+        }
+    }
+
+    public function down(): void
+    {
+        Schema::table('trading_accounts', function (Blueprint $table) {
+            $table->dropForeign(['paper_trade_setting_id']);
+            $table->dropColumn('paper_trade_setting_id');
+        });
+
+        Schema::table('paper_trade_settings', function (Blueprint $table) {
+            $table->dropForeign(['user_id']);
+            $table->dropColumn('user_id');
+        });
+    }
+};
+
 === FILE: ./laravel/database/seeders/AdminUserSeeder.php ===
 <?php
 
@@ -9247,9 +9369,11 @@ document.addEventListener('DOMContentLoaded', function () {
     const gridOptions = {
         columnDefs,
         rowModelType: 'infinite',
-        cacheBlockSize: 100,
+        cacheBlockSize: 50,
         maxBlocksInCache: 10,
-        infiniteInitialRowCount: 100,
+        infiniteInitialRowCount: 50,
+        pagination: true,
+        paginationPageSize: 50,
         defaultColDef: {
             sortable:    true,
             resizable:   true,
@@ -9305,7 +9429,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // ---- Filter change handlers ----
     ['filterStatus', 'filterSubCategory'].forEach(id => {
         document.getElementById(id).addEventListener('change', () => {
-            grid.api?.purgeInfiniteCache();
+            grid.api?.refreshInfiniteCache();
         });
     });
 });
@@ -9889,11 +10013,12 @@ $color = $colorMap[$event['color']] ?? $colorMap['secondary'];
             minWidth: 180,
             tooltipField: 'market_full',
             cellRenderer: params => {
+                if (!params.data) return params.value ?? '';
                 const dir = params.data.direction;
                 const badge = dir === 'YES'
                     ? '<span class="badge bg-success-lt me-1">YES</span>'
                     : '<span class="badge bg-danger-lt me-1">NO</span>';
-                return badge + params.value;
+                return badge + (params.value ?? '');
             },
         },
         {
@@ -9912,14 +10037,14 @@ $color = $colorMap[$event['color']] ?? $colorMap['secondary'];
             headerName: 'Size',
             field: 'position_size',
             width: 90,
-            cellRenderer: params => '$' + params.value.toFixed(2),
+            cellRenderer: params => params.value != null ? '$' + params.value.toFixed(2) : '—',
         },
         {
             headerName: 'PnL $',
             field: 'pnl_usd',
             width: 90,
             cellClass: params => params.value >= 0 ? 'text-success fw-bold' : 'text-danger fw-bold',
-            cellRenderer: params => (params.value >= 0 ? '+' : '') + '$' + params.value.toFixed(2),
+            cellRenderer: params => params.value != null ? (params.value >= 0 ? '+' : '') + '$' + params.value.toFixed(2) : '—',
             sort: 'desc',
         },
         {
@@ -9927,7 +10052,7 @@ $color = $colorMap[$event['color']] ?? $colorMap['secondary'];
             field: 'pnl_percent',
             width: 85,
             cellClass: params => params.value >= 0 ? 'text-success' : 'text-danger',
-            cellRenderer: params => (params.value >= 0 ? '+' : '') + params.value.toFixed(2) + '%',
+            cellRenderer: params => params.value != null ? (params.value >= 0 ? '+' : '') + params.value.toFixed(2) + '%' : '—',
         },
         {
             headerName: 'Score',
@@ -9976,6 +10101,27 @@ $color = $colorMap[$event['color']] ?? $colorMap['secondary'];
         },
     ];
 
+    const datasource = {
+        getRows(params) {
+            const body = {
+                startRow:  params.startRow,
+                endRow:    params.endRow,
+                sortModel: JSON.stringify(params.sortModel ?? []),
+            };
+            const qs = new URLSearchParams(body).toString();
+            fetch('/api/paper-trades/active?' + qs, {
+                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+            })
+            .then(r => r.json())
+            .then(data => {
+                params.successCallback(data.rows, data.totalRows);
+                document.getElementById('activeTradesCount').textContent = data.totalRows;
+                document.getElementById('activeTradesLastUpdated').textContent =
+                    'Updated ' + new Date().toLocaleTimeString();
+            })
+            .catch(() => params.failCallback());
+        }
+    };
     const gridOptions = {
         columnDefs,
         defaultColDef: {
@@ -9983,42 +10129,21 @@ $color = $colorMap[$event['color']] ?? $colorMap['secondary'];
             resizable: true,
             suppressMovable: false,
         },
-        rowModelType: 'serverSide',
-        serverSideDatasource: {
-            getRows(params) {
-                const body = {
-                    startRow:  params.request.startRow,
-                    endRow:    params.request.endRow,
-                    sortModel: JSON.stringify(params.request.sortModel),
-                };
-                const qs = new URLSearchParams(body).toString();
-
-                fetch('/api/paper-trades/active?' + qs, {
-                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
-                })
-                .then(r => r.json())
-                .then(data => {
-                    params.success({ rowData: data.rows, rowCount: data.totalRows });
-                    document.getElementById('activeTradesCount').textContent = data.totalRows;
-                    document.getElementById('activeTradesLastUpdated').textContent =
-                        'Updated ' + new Date().toLocaleTimeString();
-                })
-                .catch(() => params.fail());
-            }
-        },
+        rowModelType: 'infinite',
+        datasource,
         cacheBlockSize: 50,
+        maxBlocksInCache: 10,
         pagination: true,
         paginationPageSize: 25,
+        paginationPageSizeSelector: [10, 25, 50, 100],
         suppressPaginationPanel: false,
         tooltipShowDelay: 300,
         suppressCellFocus: true,
     };
-
-    agGrid.createGrid(gridEl, gridOptions);
-
+    const activeGrid = agGrid.createGrid(gridEl, gridOptions);
     // Expose refresh function untuk auto-refresh
     window.refreshActiveTradesGrid = function () {
-        gridEl.__agGrid?.api?.refreshServerSide({ purge: true });
+        activeGrid.api.purgeInfiniteCache();
     };
 })();
 </script>
@@ -10080,11 +10205,12 @@ $color = $colorMap[$event['color']] ?? $colorMap['secondary'];
             minWidth: 180,
             tooltipField: 'market_full',
             cellRenderer: params => {
+                if (!params.data) return params.value ?? '';
                 const dir = params.data.direction;
                 const badge = dir === 'YES'
                     ? '<span class="badge bg-success-lt me-1">YES</span>'
                     : '<span class="badge bg-danger-lt me-1">NO</span>';
-                return badge + params.value;
+                return badge + (params.value ?? '');
             },
         },
         {
@@ -10105,14 +10231,14 @@ $color = $colorMap[$event['color']] ?? $colorMap['secondary'];
             width: 95,
             sort: 'desc',
             cellClass: params => params.value >= 0 ? 'text-success fw-bold' : 'text-danger fw-bold',
-            cellRenderer: params => (params.value >= 0 ? '+' : '') + '$' + params.value.toFixed(2),
+            cellRenderer: params => params.value != null ? (params.value >= 0 ? '+' : '') + '$' + params.value.toFixed(2) : '—',
         },
         {
             headerName: 'ROI',
             field: 'roi_percent',
             width: 85,
             cellClass: params => params.value >= 0 ? 'text-success' : 'text-danger',
-            cellRenderer: params => (params.value >= 0 ? '+' : '') + params.value.toFixed(2) + '%',
+            cellRenderer: params => params.value != null ? (params.value >= 0 ? '+' : '') + params.value.toFixed(2) + '%' : '—',
         },
         {
             headerName: 'Exit Reason',
@@ -10148,51 +10274,52 @@ $color = $colorMap[$event['color']] ?? $colorMap['secondary'];
 
     let currentExitFilter = '';
 
+    function createDatasource() {
+        return {
+            getRows(params) {
+                const body = {
+                    startRow:   params.startRow,
+                    endRow:     params.endRow,
+                    sortModel:  JSON.stringify(params.sortModel ?? []),
+                    exitReason: currentExitFilter,
+                };
+                const qs = new URLSearchParams(body).toString();
+                fetch('/api/paper-trades/closed?' + qs, {
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                })
+                .then(r => r.json())
+                .then(data => {
+                    params.successCallback(data.rows, data.totalRows);
+                    document.getElementById('closedTradesCount').textContent = data.totalRows;
+                })
+                .catch(() => params.failCallback());
+            }
+        };
+    }
+
     const gridOptions = {
         columnDefs,
         defaultColDef: {
             sortable: true,
             resizable: true,
         },
-        rowModelType: 'serverSide',
-        serverSideDatasource: createDatasource(),
+        rowModelType: 'infinite',
+        datasource: createDatasource(),
         cacheBlockSize: 50,
+        maxBlocksInCache: 10,
         pagination: true,
         paginationPageSize: 25,
+        paginationPageSizeSelector: [10, 25, 50, 100],
         tooltipShowDelay: 300,
         suppressCellFocus: true,
     };
 
     const grid = agGrid.createGrid(gridEl, gridOptions);
 
-    function createDatasource() {
-        return {
-            getRows(params) {
-                const body = {
-                    startRow:   params.request.startRow,
-                    endRow:     params.request.endRow,
-                    sortModel:  JSON.stringify(params.request.sortModel),
-                    exitReason: currentExitFilter,
-                };
-                const qs = new URLSearchParams(body).toString();
-
-                fetch('/api/paper-trades/closed?' + qs, {
-                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
-                })
-                .then(r => r.json())
-                .then(data => {
-                    params.success({ rowData: data.rows, rowCount: data.totalRows });
-                    document.getElementById('closedTradesCount').textContent = data.totalRows;
-                })
-                .catch(() => params.fail());
-            }
-        };
-    }
-
     // Exit filter
     document.getElementById('closedTradesExitFilter')?.addEventListener('change', function () {
         currentExitFilter = this.value;
-        grid.setGridOption('serverSideDatasource', createDatasource());
+        grid.api.setDatasource(createDatasource());
     });
 })();
 </script>
@@ -12633,9 +12760,11 @@ document.addEventListener('DOMContentLoaded', function () {
     const gridOptions = {
         columnDefs,
         rowModelType: 'infinite',
-        cacheBlockSize: 100,
+        cacheBlockSize: 50,
         maxBlocksInCache: 10,
-        infiniteInitialRowCount: 100,
+        infiniteInitialRowCount: 50,
+        pagination: true,
+        paginationPageSize: 50,
         rowHeight: 48,
         headerHeight: 38,
         defaultColDef: {
@@ -12686,12 +12815,12 @@ document.addEventListener('DOMContentLoaded', function () {
     ['filterStatus', 'filterDirection'].forEach(id => {
         document.getElementById(id).addEventListener('change', () => {
             snapshotStore.clear();
-            grid.api?.purgeInfiniteCache();
+            grid.api?.refreshInfiniteCache();
         });
     });
     document.getElementById('refreshGridBtn').addEventListener('click', () => {
         snapshotStore.clear();
-        grid.api?.purgeInfiniteCache();
+        grid.api?.refreshInfiniteCache();
     });
 
     // ---- Execute Modal ----
