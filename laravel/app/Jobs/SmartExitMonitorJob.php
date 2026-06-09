@@ -97,7 +97,7 @@ final class SmartExitMonitorJob implements ShouldQueue
     public function handle(SmartExitEngineService $engine): void
     {
         $trades = PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES)
-            ->with(['signal', 'market', 'history'])
+            ->with(['signal', 'market', 'history', 'market.snapshots' => function ($q) { $q->latest()->limit(1); }])
             ->get();
 
         if ($trades->isEmpty()) {
@@ -247,6 +247,11 @@ final class SmartExitMonitorJob implements ShouldQueue
                 'exited_at'            => now(),
                 'outcome'              => $totalPnl >= 0 ? 'win' : 'loss',
             ]);
+
+            // FIX #1: Kembalikan capital + net PnL ke balance akun
+            $returnedAmount = ($sharesRemaining * (float) $trade->entry_price) + $pnl;
+            TradingAccount::where('id', $trade->trading_account_id)
+                ->increment('balance', $returnedAmount);
         });
     }
 
@@ -354,6 +359,11 @@ final class SmartExitMonitorJob implements ShouldQueue
                     'exited_at'            => now(),
                 ] : []),
             ]);
+
+            // FIX #1b: Kembalikan capital portion dari shares yang ditutup + PnL partial
+            $returnedAmount = ($sharesToClose * (float) $trade->entry_price) + $pnl;
+            TradingAccount::where('id', $trade->trading_account_id)
+                ->increment('balance', $returnedAmount);
         });
     }
 
@@ -385,7 +395,7 @@ final class SmartExitMonitorJob implements ShouldQueue
 
     private function getCurrentPrice(PaperTrade $trade): float
     {
-        $snapshot = $trade->market?->snapshots()?->latest()->first();
+        $snapshot = $trade->market?->snapshots->first();
 
         if ($snapshot && (float) $snapshot->probability_yes > 0) {
             return (float) $snapshot->probability_yes;

@@ -139,10 +139,12 @@ class EdgeCalculator:
                 ):
                     direction = "no"
 
+                spike_ratio = float(volume_24h / avg_vol)
+                dynamic_edge_3 = min(round(spike_ratio / 10, 4), 0.30)
                 signals.append({
                     "direction":      direction,
                     "trigger_source": "rule_3_volume_spike",
-                    "edge":           0.05,
+                    "edge":           dynamic_edge_3,
                     "context":        context,
                 })
 
@@ -158,12 +160,13 @@ class EdgeCalculator:
 
             # Hanya generate kalau masih ada sisa waktu (belum expired)
             # dan prob masih dalam range tidak pasti (40–60%)
-            if 0 < hours_to_expiry < 48:
+            if 6 < hours_to_expiry < 48:  # min 6h: align with Laravel guard #6
                 if Decimal("0.40") <= prob_yes <= Decimal("0.60"):
+                    dynamic_edge_4 = min(round(float(abs(prob_yes - Decimal("0.50")) * 2), 4), 0.20)
                     signals.append({
                         "direction":      "yes",
                         "trigger_source": "rule_4_time_decay",
-                        "edge":           0.05,
+                        "edge":           dynamic_edge_4,
                         "context":        context,
                     })
 

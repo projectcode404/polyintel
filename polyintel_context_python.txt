@@ -1,0 +1,4692 @@
+=== FILE: ./laravel/vendor/laravel/sail/database/pgsql/create-testing-database.sql ===
+SELECT 'CREATE DATABASE testing'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'testing')\gexec
+
+=== FILE: ./python/collectors/__init__.py ===
+
+=== FILE: ./python/collectors/markets_collector.py ===
+"""
+collectors/markets_collector.py
+
+Fetches active crypto markets from the Polymarket Gamma API and keeps
+the `markets` table in sync.
+
+Responsibilities:
+  1. Page through all active markets on the Gamma API (crypto only)
+  2. Upsert each market: insert new, update existing metadata
+  3. Mark markets as resolved when the API reports them closed
+  4. Log detailed metrics for every run
+
+NOT responsible for:
+  - Fetching snapshots (that is snapshots_collector.py)
+  - Fetching external prices (that is external_price_service.py)
+  - Signal generation or paper trading
+
+Architecture:
+  MarketsCollector depends on:
+    - PolymarketService   (HTTP, owned by this collector instance)
+    - MarketRepository    (DB writes)
+    - get_session()       (transaction management)
+
+  One MarketsCollector instance is created at scheduler startup and reused
+  across runs. The httpx.Client inside PolymarketService persists between
+  runs, reusing TCP connections for efficiency.
+
+Run cadence: every 60 minutes (configurable via MARKET_SYNC_INTERVAL_MINUTES)
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+
+from utils.db import get_session
+from utils.logger import get_logger
+from repositories.market_repository import MarketRepository
+from services.polymarket_service import PolymarketService, PolymarketAPIError
+
+log = get_logger(__name__)
+
+
+@dataclass
+class MarketCollectionResult:
+    """
+    Metrics for a single market collection run.
+    Logged at INFO level after each run for monitoring.
+    """
+    inserted: int = 0
+    updated: int = 0
+    skipped: int = 0
+    errors: int = 0
+    pages_fetched: int = 0
+    duration_seconds: float = 0.0
+
+    @property
+    def total_processed(self) -> int:
+        return self.inserted + self.updated + self.skipped + self.errors
+
+
+class MarketsCollector:
+    """
+    Synchronises the local markets table with Polymarket's Gamma API.
+
+    Usage (called by scheduler every MARKET_SYNC_INTERVAL_MINUTES):
+        collector = MarketsCollector()
+        result = collector.run()
+
+    The collector is stateless between runs — any state from the previous
+    run is discarded and re-fetched from the API.
+    """
+
+    def __init__(self) -> None:
+        self._service = PolymarketService()
+        self._market_repo = MarketRepository()
+
+    def close(self) -> None:
+        """Release the HTTP client. Called on scheduler shutdown."""
+        self._service.close()
+
+    def run(self, full_scan: bool = False) -> MarketCollectionResult:
+        """
+        Execute a market sync run.
+
+        full_scan=False (default, incremental):
+            Fetches top 500 markets by volume. Used for frequent syncs.
+            Captures all high-liquidity crypto markets. Runtime ~1-2s.
+
+        full_scan=True (daily):
+            Fetches all ~10,000 active markets. Discovers new/low-volume
+            crypto markets. Runtime ~15-35s. Run once per day at midnight.
+
+        Each page is committed in its own transaction — if a later page
+        fails, earlier pages are already persisted.
+
+        Returns a MarketCollectionResult with counts for monitoring.
+        """
+        log.info("markets_collection_start", full_scan=full_scan)
+        started_at = time.monotonic()
+        result = MarketCollectionResult()
+
+        try:
+            for page in self._service.iter_active_crypto_markets(full_scan=full_scan):
+                result.pages_fetched += 1
+                page_result = self._process_page(page)
+
+                result.inserted += page_result.inserted
+                result.updated += page_result.updated
+                result.skipped += page_result.skipped
+                result.errors += page_result.errors
+
+        except PolymarketAPIError as exc:
+            log.error(
+                "markets_collection_api_error",
+                error=str(exc),
+                status_code=exc.status_code,
+                pages_fetched=result.pages_fetched,
+            )
+            # Do not re-raise — partial sync is better than no sync.
+            # The scheduler will retry on the next interval.
+
+        except Exception as exc:
+            log.exception("markets_collection_unexpected_error", error=str(exc))
+            # Unexpected errors re-raise so the scheduler can log them
+            # and we know something is genuinely broken.
+            raise
+
+        finally:
+            result.duration_seconds = time.monotonic() - started_at
+
+        log.info(
+            "markets_collection_complete",
+            inserted=result.inserted,
+            updated=result.updated,
+            skipped=result.skipped,
+            errors=result.errors,
+            pages=result.pages_fetched,
+            duration_seconds=round(result.duration_seconds, 2),
+        )
+
+        return result
+
+    # -------------------------------------------------------------------------
+    # Private — page processing
+    # -------------------------------------------------------------------------
+
+    def _process_page(self, page: list) -> MarketCollectionResult:
+        """
+        Process one page of markets within a single transaction.
+
+        The entire page is committed atomically. If any market in the page
+        raises an unexpected exception, the page transaction is rolled back
+        and we log the error — other pages are not affected.
+        """
+        result = MarketCollectionResult()
+
+        try:
+            with get_session() as session:
+                for raw_market in page:
+                    try:
+                        self._upsert_market(session, raw_market, result)
+                    except Exception as exc:
+                        # Per-market error: log and count, do not abort the page
+                        result.errors += 1
+                        log.error(
+                            "market_upsert_error",
+                            condition_id=getattr(raw_market, "condition_id", "unknown"),
+                            error=str(exc),
+                        )
+
+        except Exception as exc:
+            # Page-level transaction failure — rolled back automatically
+            log.error("page_transaction_failed", error=str(exc), page_size=len(page))
+            result.errors += len(page)
+
+        return result
+
+    def _upsert_market(self, session, raw_market, result: MarketCollectionResult) -> None:
+        """
+        Upsert a single RawMarket into the database.
+
+        We determine insert vs update by checking if the market already
+        exists — this drives the result counters for monitoring accuracy.
+
+        Note: the actual upsert is idempotent (ON CONFLICT DO UPDATE).
+        The pre-check here is only for accurate metrics, not correctness.
+        """
+        if not raw_market.condition_id:
+            log.warning("market_missing_condition_id", question=raw_market.question[:60])
+            result.skipped += 1
+            return
+
+        # Check existence for metrics (cheap query, uses the condition_id unique index)
+        existing = self._market_repo.find_by_condition_id(session, raw_market.condition_id)
+        is_new = existing is None
+
+        # Upsert
+        market = self._market_repo.upsert_from_api(session, raw_market)
+
+        if market is None:
+            result.errors += 1
+            return
+
+        # Handle resolution: if Gamma says it's resolved but we have it as active,
+        # mark_resolved() flips is_tracked=False to stop snapshot collection
+        if raw_market.status == "resolved" and existing and existing.status == "active":
+            from datetime import timezone
+            from repositories.market_repository import MarketRepository
+            resolved_dt = MarketRepository._parse_dt(raw_market.resolved_at)
+            if resolved_dt:
+                self._market_repo.mark_resolved(session, raw_market.condition_id, resolved_dt)
+
+        if is_new:
+            result.inserted += 1
+            log.info(
+                "market_inserted",
+                condition_id=raw_market.condition_id,
+                question=raw_market.question[:80] if raw_market.question else "",
+                status=raw_market.status,
+            )
+        else:
+            result.updated += 1
+            log.debug(
+                "market_updated",
+                condition_id=raw_market.condition_id,
+                status=raw_market.status,
+            )
+
+=== FILE: ./python/collectors/signal_collector.py ===
+"""
+collectors/signal_collector.py
+
+Changelog:
+  v1.1 — tambah filter di query markets:
+    - hanya category = 'crypto'
+    - hanya market yang end_date belum lewat (atau end_date NULL)
+    Sebelumnya: semua active market dievaluasi termasuk sports/politics
+    dan market yang sudah expired.
+"""
+
+from utils.logger import get_logger
+import time
+from datetime import datetime, timezone
+from sqlalchemy import select, or_
+
+from utils.db import get_session
+from models.market import Market, MarketSnapshot
+from models.stats import MarketDailyStat
+from services.edge_calculator import EdgeCalculator
+from repositories.signal_repository import SignalRepository
+
+log = get_logger(__name__)
+
+
+class SignalCollector:
+    """
+    Orchestrates the signal generation process by tying together
+    markets, snapshots, stats, and the EdgeCalculator.
+    """
+
+    def __init__(self):
+        self.edge_calculator = EdgeCalculator()
+        self.signal_repo     = SignalRepository()
+
+    def run(self) -> None:
+        log.info("signal_collector_run_start")
+        start_time = time.monotonic()
+
+        markets_evaluated  = 0
+        markets_skipped    = 0
+        signals_generated  = 0
+        now = datetime.now(timezone.utc)
+
+        with get_session() as session:
+            markets = session.scalars(
+                select(Market).where(
+                    Market.status      == "active",
+                    Market.is_tracked  == True,
+                    Market.deleted_at  == None,
+                    # Hanya crypto — non-crypto tidak punya edge data crypto
+                    Market.category    == "crypto",
+                    # Hanya market yang belum expired
+                    # (end_date NULL = evergreen market, tetap masuk)
+                    or_(
+                        Market.end_date == None,
+                        Market.end_date > now,
+                    ),
+                    # Exclude micro/noise markets:
+                    # "Up or Down" = 5-minute price direction markets,
+                    # probability always ~50/50, no real edge possible.
+                    Market.question.notilike("%up or down%"),
+                )
+            ).all()
+
+            log.info("signal_collector_markets_loaded", count=len(markets))
+
+            for market in markets:
+                # Latest snapshot
+                latest_snapshot = session.scalars(
+                    select(MarketSnapshot)
+                    .where(MarketSnapshot.market_id == market.id)
+                    .order_by(MarketSnapshot.snapshotted_at.desc())
+                    .limit(1)
+                ).first()
+
+                if not latest_snapshot:
+                    markets_skipped += 1
+                    continue
+
+                # Daily stat hari ini
+                daily_stat = session.scalars(
+                    select(MarketDailyStat)
+                    .where(MarketDailyStat.market_id == market.id)
+                    .where(MarketDailyStat.stat_date  == now.date())
+                ).first()
+
+                signals = self.edge_calculator.evaluate(market, latest_snapshot, daily_stat)
+
+                if signals:
+                    inserted = self.signal_repo.store_signals(signals, market.id)
+                    signals_generated += inserted
+
+                markets_evaluated += 1
+
+        duration = time.monotonic() - start_time
+        log.info(
+            "signal_collector_run_done",
+            evaluated=markets_evaluated,
+            skipped_no_snapshot=markets_skipped,
+            signals_generated=signals_generated,
+            duration_sec=round(duration, 2),
+        )
+=== FILE: ./python/collectors/snapshots_collector.py ===
+"""
+collectors/snapshots_collector.py
+
+Changelog:
+  v1.4 — handle ClosedMarketSignal dari get_orderbook().
+          Ketika CLOB melaporkan market closed, collector otomatis
+          mark_resolved di DB sehingga market tidak di-snapshot lagi.
+          Sebelumnya: market closed di-skip setiap run → log error spam.
+          Sekarang:   market closed di-mark resolved sekali → hilang dari queue.
+
+  v1.5 — FIX DetachedInstanceError: ganti get_active_tracked() dengan
+          get_active_tracked_dto().
+
+          ROOT CAUSE:
+            _load_tracked_markets() membuka session, fetch ORM objects,
+            lalu menutup session. ORM objects yang dikembalikan menjadi
+            "detached" — mereka masih terikat ke session yang sudah tutup.
+            Ketika _process_batch() mengakses m.condition_id, m.volume_usd,
+            dll, SQLAlchemy mencoba lazy-load → DetachedInstanceError.
+            Error ini di-swallow oleh except block di _process_batch()
+            sehingga tidak muncul di log — silent failure.
+
+          FIX:
+            get_active_tracked_dto() mengembalikan plain MarketDTO dataclass.
+            DTO tidak terikat session — aman diakses kapan saja, di thread
+            mana saja, setelah session ditutup.
+
+          JUGA FIX:
+            Import MarketDTO dari market_repository agar type hints akurat.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+from config.settings import settings
+from utils.db import get_session
+from utils.logger import get_logger
+from repositories.market_repository import MarketRepository, MarketDTO
+from repositories.snapshot_repository import SnapshotRepository
+from services.polymarket_service import (
+    PolymarketService,
+    PolymarketAPIError,
+    RawOrderbook,
+    ClosedMarketSignal,
+)
+from services.external_price_service import ExternalPriceService, ExternalPriceContext
+
+log = get_logger(__name__)
+
+COMMIT_BATCH_SIZE = 20
+
+
+@dataclass
+class SnapshotCollectionResult:
+    """Metrics for a single snapshot run."""
+    snapshots_written: int = 0
+    snapshots_skipped: int = 0
+    markets_failed: int = 0
+    markets_closed: int = 0        # market ditandai resolved karena CLOB closed
+    markets_processed: int = 0
+    external_context_available: bool = False
+    duration_seconds: float = 0.0
+
+    @property
+    def success_rate(self) -> float:
+        if self.markets_processed == 0:
+            return 0.0
+        return self.snapshots_written / self.markets_processed
+
+
+class SnapshotsCollector:
+    """Collects live probability snapshots for all tracked markets."""
+
+    def __init__(self) -> None:
+        self._polymarket = PolymarketService()
+        self._price_service = ExternalPriceService()
+        self._market_repo = MarketRepository()
+        self._snapshot_repo = SnapshotRepository()
+
+    def close(self) -> None:
+        self._polymarket.close()
+        self._price_service.close()
+
+    def run(self) -> SnapshotCollectionResult:
+        log.info("snapshots_collection_start")
+        started_at = time.monotonic()
+        result = SnapshotCollectionResult()
+
+        try:
+            markets = self._load_tracked_markets()
+            if not markets:
+                log.warning("snapshots_no_tracked_markets")
+                return result
+
+            total = len(markets)
+            log.info("snapshots_markets_loaded", count=total)
+
+            context = self._fetch_external_context()
+            result.external_context_available = context.btc_price_usd is not None
+
+            markets_to_process = markets[: settings.snapshot_batch_size]
+            if len(markets_to_process) < total:
+                log.warning(
+                    "snapshots_batch_capped",
+                    total=total,
+                    cap=settings.snapshot_batch_size,
+                )
+
+            batches = self._chunk(markets_to_process, COMMIT_BATCH_SIZE)
+            for batch_num, batch in enumerate(batches, start=1):
+                batch_result = self._process_batch(batch, context, batch_num)
+                result.snapshots_written  += batch_result.snapshots_written
+                result.snapshots_skipped  += batch_result.snapshots_skipped
+                result.markets_failed     += batch_result.markets_failed
+                result.markets_closed     += batch_result.markets_closed
+                result.markets_processed  += batch_result.markets_processed
+
+        except Exception as exc:
+            log.exception("snapshots_collection_unexpected_error", error=str(exc))
+            raise
+
+        finally:
+            result.duration_seconds = time.monotonic() - started_at
+
+        log.info(
+            "snapshots_collection_complete",
+            written=result.snapshots_written,
+            skipped=result.snapshots_skipped,
+            failed=result.markets_failed,
+            closed_and_resolved=result.markets_closed,
+            processed=result.markets_processed,
+            success_rate=round(result.success_rate, 3),
+            external_context=result.external_context_available,
+            duration_seconds=round(result.duration_seconds, 2),
+        )
+
+        return result
+
+    # -------------------------------------------------------------------------
+    # Private
+    # -------------------------------------------------------------------------
+
+    def _load_tracked_markets(self) -> list[MarketDTO]:
+        """
+        Load active tracked markets sebagai plain DTO objects.
+
+        WAJIB menggunakan get_active_tracked_dto() — BUKAN get_active_tracked().
+
+        Alasan: session ditutup setelah with-block selesai. ORM objects
+        yang dikembalikan oleh get_active_tracked() akan menjadi detached
+        dan raise DetachedInstanceError ketika diakses di _process_batch().
+        Error ini silent — di-swallow oleh except block — sehingga sangat
+        sulit di-debug di production.
+
+        MarketDTO adalah plain dataclass, tidak terikat session.
+        Aman diakses kapan saja setelah session ditutup.
+        """
+        with get_session() as session:
+            return self._market_repo.get_active_tracked_dto(session)
+
+    def _fetch_external_context(self) -> ExternalPriceContext:
+        try:
+            return self._price_service.get_context()
+        except Exception as exc:
+            log.warning("external_context_fetch_failed", error=str(exc))
+            from services.external_price_service import ExternalPriceContext
+            return ExternalPriceContext(
+                btc_price_usd=None,
+                eth_price_usd=None,
+                fear_greed_index=None,
+                btc_dominance=None,
+            )
+
+    def _process_batch(
+        self,
+        markets: list[MarketDTO],
+        context: ExternalPriceContext,
+        batch_num: int,
+    ) -> SnapshotCollectionResult:
+        result = SnapshotCollectionResult()
+
+        # Fetch semua orderbooks di luar transaksi (HTTP tidak blocking DB)
+        condition_ids = [m.condition_id for m in markets]
+        orderbooks = self._fetch_orderbooks(condition_ids)
+
+        snapshotted_at = datetime.now(timezone.utc)
+
+        try:
+            with get_session() as session:
+                for market in markets:
+                    result.markets_processed += 1
+                    orderbook = orderbooks.get(market.condition_id)
+
+                    # ClosedMarketSignal: market closed di CLOB
+                    # Mark resolved di DB → keluar dari snapshot queue selamanya
+                    if isinstance(orderbook, ClosedMarketSignal):
+                        result.markets_closed += 1
+                        log.info(
+                            "market_auto_resolved_from_clob",
+                            market_id=market.id,
+                            condition_id=market.condition_id,
+                            reason=orderbook.reason,
+                        )
+                        self._market_repo.mark_resolved(
+                            session,
+                            condition_id=market.condition_id,
+                            resolved_at=snapshotted_at,
+                        )
+                        continue
+
+                    # None: API/network error, skip untuk run ini, retry nanti
+                    if orderbook is None:
+                        result.markets_failed += 1
+                        log.warning(
+                            "snapshot_skipped_no_orderbook",
+                            market_id=market.id,
+                            condition_id=market.condition_id,
+                        )
+                        continue
+
+                    # RawOrderbook: normal, tulis snapshot
+                    written = self._write_snapshot(
+                        session=session,
+                        market=market,
+                        orderbook=orderbook,
+                        context=context,
+                        snapshotted_at=snapshotted_at,
+                    )
+
+                    if written:
+                        result.snapshots_written += 1
+                        self._market_repo.update_probability_cache(
+                            session,
+                            market_id=market.id,
+                            probability=orderbook.probability_yes,
+                        )
+                    else:
+                        result.snapshots_skipped += 1
+
+        except Exception as exc:
+            log.error(
+                "snapshot_batch_transaction_failed",
+                batch=batch_num,
+                error=str(exc),
+                market_count=len(markets),
+            )
+            result.markets_failed += len(markets)
+            result.snapshots_written = 0
+
+        log.debug(
+            "snapshot_batch_complete",
+            batch=batch_num,
+            written=result.snapshots_written,
+            skipped=result.snapshots_skipped,
+            failed=result.markets_failed,
+            closed=result.markets_closed,
+        )
+
+        return result
+
+    def _fetch_orderbooks(
+        self, condition_ids: list[str]
+    ) -> dict[str, RawOrderbook | ClosedMarketSignal | None]:
+        import concurrent.futures
+
+        results: dict[str, RawOrderbook | ClosedMarketSignal | None] = {}
+
+        def fetch_single(cid: str) -> tuple[str, RawOrderbook | ClosedMarketSignal | None]:
+            try:
+                return cid, self._polymarket.get_orderbook(cid)
+            except PolymarketAPIError as exc:
+                # 404 = permanent, orderbook tidak ada → mark closed
+                if exc.status_code == 404:
+                    log.info(
+                        "orderbook_404_treating_as_closed",
+                        condition_id=cid,
+                    )
+                    return cid, ClosedMarketSignal(condition_id=cid, reason="no_orderbook")
+                # 5xx atau lainnya = transient, skip run ini saja
+                log.error("orderbook_fetch_failed", condition_id=cid, error=str(exc))
+                return cid, None
+            except Exception as exc:
+                log.error("orderbook_fetch_failed", condition_id=cid, error=str(exc))
+                return cid, None
+
+        max_threads = 15
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
+            future_to_cid = {executor.submit(fetch_single, cid): cid for cid in condition_ids}
+            for future in concurrent.futures.as_completed(future_to_cid):
+                cid, orderbook = future.result()
+                results[cid] = orderbook
+
+        return results
+
+    def _write_snapshot(
+        self,
+        session,
+        market: MarketDTO,
+        orderbook: RawOrderbook,
+        context: ExternalPriceContext,
+        snapshotted_at: datetime,
+    ) -> bool:
+        snapshot = self._snapshot_repo.insert_snapshot(
+            session,
+            market_id=market.id,
+            probability_yes=orderbook.probability_yes,
+            probability_no=orderbook.probability_no,
+            best_bid=orderbook.best_bid,
+            best_ask=orderbook.best_ask,
+            spread=orderbook.spread,
+            volume_usd=market.volume_usd,
+            volume_24h_usd=market.volume_24h_usd,
+            liquidity_usd=market.liquidity_usd,
+            snapshotted_at=snapshotted_at,
+            btc_price_usd=context.btc_price_usd,
+            eth_price_usd=context.eth_price_usd,
+            fear_greed_index=context.fear_greed_index,
+            btc_dominance=context.btc_dominance,
+            collector_version=settings.collector_version,
+        )
+        return snapshot is not None
+
+    @staticmethod
+    def _chunk(lst: list, size: int) -> list[list]:
+        return [lst[i : i + size] for i in range(0, len(lst), size)]
+=== FILE: ./python/collectors/stats_collector.py ===
+from utils.logger import get_logger
+from datetime import datetime, timezone, timedelta
+from sqlalchemy import select, func
+
+from utils.db import get_session
+from models.market import Market, MarketSnapshot
+from models.stats import MarketDailyStat
+
+log = get_logger(__name__)
+
+class StatsCollector:
+    """
+    Precomputes daily statistics for markets, such as 7-day average volume
+    and 24h momentum, to be used by the EdgeCalculator for signal generation.
+    """
+
+    def run(self) -> None:
+        log.info("stats_collector_run_start")
+        
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        yesterday_time = now - timedelta(days=1)
+        seven_days_ago = now - timedelta(days=7)
+        
+        updated_count = 0
+        
+        with get_session() as session:
+            # 1. Get active markets
+            markets = session.scalars(
+                select(Market).where(Market.status == "active")
+            ).all()
+            
+            for market in markets:
+                # Calculate 7d average volume
+                # For this, we can average the 'volume_24h_usd' from snapshots taken around midnight,
+                # but to be simple, we can just look at the latest snapshot's total volume and subtract 
+                # the total volume from 7 days ago, then divide by 7.
+                # Actually, if we want avg 24h volume over 7 days, we can take the average of volume_24h_usd.
+                avg_vol_result = session.execute(
+                    select(func.avg(MarketSnapshot.volume_24h_usd))
+                    .where(MarketSnapshot.market_id == market.id)
+                    .where(MarketSnapshot.snapshotted_at >= seven_days_ago)
+                ).scalar()
+                
+                avg_vol_7d = avg_vol_result if avg_vol_result is not None else 0
+                
+                # Calculate 24h momentum (probability change)
+                latest_snapshot = session.scalars(
+                    select(MarketSnapshot)
+                    .where(MarketSnapshot.market_id == market.id)
+                    .order_by(MarketSnapshot.snapshotted_at.desc())
+                    .limit(1)
+                ).first()
+                
+                snapshot_24h_ago = session.scalars(
+                    select(MarketSnapshot)
+                    .where(MarketSnapshot.market_id == market.id)
+                    .where(MarketSnapshot.snapshotted_at <= yesterday_time)
+                    .order_by(MarketSnapshot.snapshotted_at.desc())
+                    .limit(1)
+                ).first()
+                
+                momentum_24h = 0
+                if latest_snapshot and snapshot_24h_ago:
+                    momentum_24h = float(latest_snapshot.probability_yes) - float(snapshot_24h_ago.probability_yes)
+                    
+                # Store or update the daily stat
+                stat = session.scalars(
+                    select(MarketDailyStat)
+                    .where(MarketDailyStat.market_id == market.id)
+                    .where(MarketDailyStat.stat_date == today)
+                ).first()
+                
+                if not stat:
+                    stat = MarketDailyStat(
+                        market_id=market.id,
+                        stat_date=today,
+                    )
+                    session.add(stat)
+                
+                stat.volume_7d_avg_usd = avg_vol_7d
+                stat.momentum_24h_percent = momentum_24h
+                
+                updated_count += 1
+                
+            session.commit()
+            
+        log.info("stats_collector_run_done", markets_processed=updated_count)
+
+=== FILE: ./python/config/__init__.py ===
+
+=== FILE: ./python/config/settings.py ===
+"""
+config/settings.py  (Sprint 2 — extends Sprint 1 with new tuning knobs)
+
+All configuration from environment variables. No hardcoded values anywhere.
+Pydantic-settings validates types at startup and raises clear errors on
+misconfiguration, so the process fails fast rather than silently misbehaving.
+"""
+
+from __future__ import annotations
+from urllib.parse import quote_plus
+from pydantic_settings import BaseSettings
+from pydantic import field_validator
+
+
+class Settings(BaseSettings):
+
+    # -------------------------------------------------------------------------
+    # Database
+    # -------------------------------------------------------------------------
+    db_host: str = "localhost"
+    db_port: int = 5432
+    db_database: str = "polymarket"
+    db_username: str = "polymarket"
+    db_password: str
+
+    # -------------------------------------------------------------------------
+    # Redis  (reserved for Sprint 3 cache layer)
+    # -------------------------------------------------------------------------
+    redis_host: str = "redis"
+    redis_port: int = 6379
+
+    # -------------------------------------------------------------------------
+    # Polymarket API endpoints
+    # -------------------------------------------------------------------------
+    polymarket_api_key: str = ""
+
+    # Gamma API  — market metadata: question, end_date, category, tags, etc.
+    polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
+
+    # CLOB API   — live orderbook / probability / volume data
+    polymarket_clob_url: str = "https://clob.polymarket.com"
+
+    # -------------------------------------------------------------------------
+    # Collector schedule
+    # -------------------------------------------------------------------------
+    snapshot_interval_minutes: int = 5
+    market_sync_interval_minutes: int = 60
+
+    # How many markets per Gamma API page request
+    gamma_page_size: int = 100
+
+    # Safety cap: max markets to snapshot in one run (prevents runaway loops)
+    snapshot_batch_size: int = 200
+
+    # -------------------------------------------------------------------------
+    # HTTP client
+    # -------------------------------------------------------------------------
+    http_connect_timeout: float = 10.0
+    http_read_timeout: float = 30.0
+
+    # -------------------------------------------------------------------------
+    # Retry policy (used by @retry decorator in utils/retry.py)
+    # -------------------------------------------------------------------------
+    max_retries: int = 3
+    retry_backoff_seconds: float = 2.0
+
+    # -------------------------------------------------------------------------
+    # Collector identity — written to every market_snapshots row
+    # -------------------------------------------------------------------------
+    collector_version: str = "1.0.0"
+
+    # -------------------------------------------------------------------------
+    # Logging
+    # -------------------------------------------------------------------------
+    log_level: str = "INFO"
+    log_format: str = "console"   # "console" (dev)  |  "json" (production)
+    debug_sql: bool = False
+
+    # -------------------------------------------------------------------------
+    # Computed properties
+    # -------------------------------------------------------------------------
+
+    @field_validator("snapshot_batch_size")   # ← tambah sebelum @property database_url
+    @classmethod
+    def validate_batch_size(cls, v: int) -> int:
+        if v < 50:
+            raise ValueError("snapshot_batch_size minimum 50")
+        return v
+
+    @property
+    def database_url(self) -> str:
+        """SQLAlchemy-compatible URL. Password is URL-encoded to handle special chars."""
+        password = quote_plus(self.db_password)
+        return (
+            f"postgresql+psycopg2://{self.db_username}:{password}"
+            f"@{self.db_host}:{self.db_port}/{self.db_database}"
+        )
+
+    @property
+    def http_timeout(self) -> tuple[float, float]:
+        """(connect_timeout, read_timeout) — passed directly to httpx.Timeout."""
+        return (self.http_connect_timeout, self.http_read_timeout)
+
+    model_config = {"env_file": ".env", "case_sensitive": False}
+
+
+# Module-level singleton — import this everywhere
+settings = Settings()
+
+=== FILE: ./python/models/__init__.py ===
+from .market import Base, Market, MarketSnapshot, MarketOutcome
+from .signal import Signal
+from .stats import MarketDailyStat
+
+__all__ = [
+    "Base",
+    "Market",
+    "MarketSnapshot",
+    "MarketOutcome",
+    "Signal",
+    "MarketDailyStat",
+]
+
+=== FILE: ./python/models/market.py ===
+"""
+models/market.py
+
+SQLAlchemy ORM models — mirror exact dari Laravel migrations.
+Python writes, Laravel reads. Semua timestamp UTC.
+
+Changelog:
+  v1.3 — tambah kolom enrichment dari Gamma API field audit:
+    - volume_24h_usd   : rolling 24h volume dari volume24hr
+    - best_bid         : dari bestBid Gamma response
+    - best_ask         : dari bestAsk Gamma response  
+    - spread           : dari spread Gamma response
+    - price_change_1h  : dari oneHourPriceChange
+    - price_change_1d  : dari oneDayPriceChange
+
+  MIGRATION REQUIRED sebelum deploy:
+    php artisan make:migration add_enrichment_fields_to_markets_table
+    Lihat file migration yang disertakan bersama fix ini.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Optional
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+# =============================================================================
+# Market
+# =============================================================================
+
+class Market(Base):
+    __tablename__ = "markets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    condition_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    slug: Mapped[Optional[str]] = mapped_column(String(200), unique=True, nullable=True)
+    question: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    category: Mapped[str] = mapped_column(String(50), default="crypto", nullable=False)
+    sub_category: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    tags: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    resolution_source: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+    start_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    end_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="active", nullable=False)
+    market_probability: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+
+    # Volume
+    volume_usd: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0, nullable=False)
+    volume_24h_usd: Mapped[Decimal] = mapped_column(
+        Numeric(20, 2), default=0, nullable=False,
+        comment="Rolling 24h volume dari Gamma API field volume24hr"
+    )
+    liquidity_usd: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0, nullable=False)
+
+    # Traders — Gamma API tidak expose jumlah trader per market.
+    # num_traders = 0 sampai ada source data yang valid.
+    # Nullable agar bisa dibedakan antara "0 trader" vs "belum diketahui".
+    num_traders: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Orderbook snapshot dari Gamma API
+    # Less real-time dari CLOB (~1-5 min delay) tapi tidak butuh extra API call.
+    # Snapshot table tetap pakai CLOB untuk data real-time.
+    best_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    best_ask: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    spread: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+
+    # Price movement — untuk signal generation dan anomaly detection
+    price_change_1h: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6), nullable=True)
+    price_change_1d: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6), nullable=True)
+
+    # AI fields — diisi oleh AI Engine (Sprint 4)
+    ai_probability: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    edge: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_tracked: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Relationships
+    snapshots: Mapped[list["MarketSnapshot"]] = relationship(
+        back_populates="market",
+        cascade="all, delete-orphan",
+    )
+    outcome: Mapped[Optional["MarketOutcome"]] = relationship(
+        back_populates="market",
+        uselist=False,
+    )
+
+    __table_args__ = (
+        Index("markets_status_category_tracked_idx", "status", "category", "is_tracked"),
+        Index("markets_end_date_status_idx", "end_date", "status"),
+        Index("markets_edge_idx", "edge"),
+        Index("markets_probability_idx", "market_probability"),
+        Index("markets_last_synced_idx", "last_synced_at"),
+        Index("markets_volume_24h_idx", "volume_24h_usd"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Market id={self.id} condition_id={self.condition_id!r} status={self.status!r}>"
+
+
+# =============================================================================
+# MarketSnapshot
+# =============================================================================
+
+class MarketSnapshot(Base):
+    __tablename__ = "market_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("markets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    probability_yes: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    probability_no: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    best_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    best_ask: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    spread: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    volume_usd: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0, nullable=False)
+    volume_24h_usd: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0, nullable=False)
+    liquidity_usd: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0, nullable=False)
+    btc_price_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 2), nullable=True)
+    eth_price_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 2), nullable=True)
+    fear_greed_index: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
+    btc_dominance: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 4), nullable=True)
+    collector_version: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    snapshotted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    market: Mapped["Market"] = relationship(back_populates="snapshots")
+
+    __table_args__ = (
+        Index("snapshots_market_time_idx", "market_id", "snapshotted_at"),
+        Index("snapshots_time_idx", "snapshotted_at"),
+        Index("snapshots_market_prob_idx", "market_id", "probability_yes"),
+        Index("snapshots_volume_idx", "market_id", "volume_24h_usd"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<MarketSnapshot id={self.id} market_id={self.market_id} "
+            f"prob_yes={self.probability_yes} at={self.snapshotted_at}>"
+        )
+
+
+# =============================================================================
+# MarketOutcome
+# =============================================================================
+
+class MarketOutcome(Base):
+    __tablename__ = "market_outcomes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("markets.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+    )
+
+    winning_side: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        comment="yes | no | cancelled",
+    )
+    resolution_price: Mapped[Decimal] = mapped_column(
+        Numeric(8, 6),
+        nullable=False,
+        comment="1.0 = YES resolved, 0.0 = NO resolved",
+    )
+
+    final_probability_before_resolution: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(8, 6), nullable=True
+    )
+    peak_probability_yes: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    low_probability_yes: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 6), nullable=True)
+    total_volume_usd: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=0, nullable=False)
+
+    resolved_by: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    resolution_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    market: Mapped["Market"] = relationship(back_populates="outcome")
+
+    __table_args__ = (
+        Index("outcomes_winning_side_idx", "winning_side"),
+        Index("outcomes_resolved_at_idx", "resolved_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<MarketOutcome id={self.id} market_id={self.market_id} side={self.winning_side!r}>"
+
+    def resolved_yes(self) -> bool:
+        return self.winning_side == "yes"
+
+    def was_cancelled(self) -> bool:
+        return self.winning_side == "cancelled"
+
+    def numeric_outcome(self) -> Optional[float]:
+        """Untuk Brier score: 1.0 jika YES, 0.0 jika NO, None jika cancelled."""
+        return {"yes": 1.0, "no": 0.0, "cancelled": None}.get(self.winning_side)
+=== FILE: ./python/models/signal.py ===
+"""
+models/signal.py
+
+Changelog:
+  v1.1 — filter crypto & non-expired markets di signal_collector.
+  v1.2 — Sprint 3: tambah evaluation fields.
+          resolved_outcome, is_correct, realized_roi, resolved_at
+          Semua nullable: signals existing (pending) belum punya nilai.
+          NULL = belum dievaluasi. Diisi oleh SignalEvaluator setelah
+          market_outcomes tersedia.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Optional
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from .market import Base
+
+
+class Signal(Base):
+    __tablename__ = "signals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("markets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    ai_prediction_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    direction: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        comment="yes | no — which side we are signalling",
+    )
+
+    # --- Signal context at fire time ---
+    market_probability_at_signal: Mapped[Decimal] = mapped_column(
+        Numeric(8, 6),
+        nullable=False,
+        comment="Market probability when signal was generated",
+    )
+    ai_probability_at_signal: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(8, 6),
+        nullable=True,
+        comment="AI probability at signal time — populated in Sprint 4",
+    )
+    edge_at_signal: Mapped[Decimal] = mapped_column(
+        Numeric(8, 6),
+        nullable=False,
+        comment="Edge when signal fired",
+    )
+    confidence_at_signal: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(8, 6),
+        nullable=True,
+        comment="Confidence score — populated in Sprint 4",
+    )
+
+    min_edge_threshold: Mapped[Decimal] = mapped_column(
+        Numeric(8, 6),
+        default=Decimal("0.05"),
+        nullable=False,
+    )
+    trigger_source: Mapped[str] = mapped_column(
+        String(50),
+        default="edge_threshold",
+        nullable=False,
+        comment="Rule name: rule_1_extreme_low, rule_2_momentum_up, etc.",
+    )
+    status: Mapped[str] = mapped_column(
+        String(30),
+        default="pending",
+        nullable=False,
+        comment="pending | resolved | expired | cancelled",
+    )
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    snapshot_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    fired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="When the signal was generated",
+    )
+    expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # -------------------------------------------------------------------------
+    # Sprint 3 — Evaluation fields
+    # Diisi oleh services/signal_evaluator.py setelah market_outcomes tersedia.
+    # NULL = belum dievaluasi.
+    # -------------------------------------------------------------------------
+
+    resolved_outcome: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="yes | no | cancelled — copied from market_outcomes.winning_side",
+    )
+    is_correct: Mapped[Optional[bool]] = mapped_column(
+        Boolean,
+        nullable=True,
+        comment="True if signal direction matched winning_side. NULL = not yet evaluated.",
+    )
+    realized_roi: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(10, 4),
+        nullable=True,
+        comment=(
+            "ROI % based on entry probability and final outcome. "
+            "NULL = not yet evaluated. "
+            "Formula YES win:  ((1 - entry) / entry) * 100. "
+            "Formula NO  win:  (entry / (1 - entry)) * 100. "
+            "Loss (either direction): -100.0"
+        ),
+    )
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Copied from market_outcomes.resolved_at — actual market resolution time.",
+    )
+
+    # -------------------------------------------------------------------------
+    # Sprint 4 — Raw market metrics at signal time
+    # Diisi oleh signal_repository.py dari EdgeCalculator context.
+    # Digunakan oleh SignalRankerService untuk composite score.
+    # Semua nullable: signal lama sebelum Sprint 4 tidak punya nilai ini.
+    # -------------------------------------------------------------------------
+
+    momentum_24h_percent: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(10, 6),
+        nullable=True,
+        comment="24h probability momentum percent at signal time",
+    )
+    liquidity_usd: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(20, 2),
+        nullable=True,
+        comment="Market liquidity (USD) from snapshot at signal time",
+    )
+    volume_24h_usd: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(20, 2),
+        nullable=True,
+        comment="24h trading volume (USD) at signal time",
+    )
+    spread: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(8, 6),
+        nullable=True,
+        comment="Bid-ask spread at signal time",
+    )
+
+    # --- Timestamps ---
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        # Existing indexes (keep)
+        Index("signals_market_status_idx", "market_id", "status"),
+        Index("signals_source_idx", "trigger_source"),
+        Index("signals_status_fired_idx", "status", "fired_at"),
+        Index("signals_direction_idx", "direction"),
+        Index("signals_edge_idx", "edge_at_signal"),
+        # Sprint 3 — new indexes
+        Index("signals_is_correct_idx", "is_correct"),
+        Index("signals_resolved_at_idx", "resolved_at"),
+        Index("signals_roi_idx", "realized_roi"),
+        Index("signals_source_correct_idx", "trigger_source", "is_correct"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Signal id={self.id} market_id={self.market_id} "
+            f"rule={self.trigger_source!r} status={self.status!r}>"
+        )
+
+    # -------------------------------------------------------------------------
+    # Convenience helpers — used by SignalEvaluator
+    # -------------------------------------------------------------------------
+
+    @property
+    def entry_price(self) -> Decimal:
+        """
+        Entry price = market_probability_at_signal.
+        For YES signals: probability_yes at fire time.
+        For NO  signals: same value (evaluator adjusts ROI formula).
+        """
+        return self.market_probability_at_signal
+
+    @property
+    def is_evaluated(self) -> bool:
+        """True when this signal has been evaluated against an outcome."""
+        return self.is_correct is not None
+
+    @property
+    def is_pending(self) -> bool:
+        return self.status == "pending"
+
+=== FILE: ./python/models/stats.py ===
+from __future__ import annotations
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Optional
+
+from sqlalchemy import (
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from .market import Base
+
+class MarketDailyStat(Base):
+    __tablename__ = "market_daily_stats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("markets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    stat_date: Mapped[date] = mapped_column(Date, nullable=False)
+    
+    volume_7d_avg_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 2), nullable=True)
+    oi_change_percent: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6), nullable=True)
+    momentum_24h_percent: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6), nullable=True)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("market_id", "stat_date", name="mkt_daily_stats_unique"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<MarketDailyStat market_id={self.market_id} date={self.stat_date}>"
+
+=== FILE: ./python/repositories/__init__.py ===
+
+=== FILE: ./python/repositories/market_repository.py ===
+"""
+repositories/market_repository.py
+
+All database access for the `markets` table.
+
+Design decisions:
+- Repository pattern: all SQL/ORM logic lives here. Collectors never
+  touch SQLAlchemy directly — they call repository methods.
+- Returns ORM objects (Market instances), not raw rows. Collectors work
+  with typed objects that match the schema exactly.
+- upsert_from_api() uses PostgreSQL's INSERT ... ON CONFLICT DO UPDATE
+  via SQLAlchemy's insert().on_conflict_do_update(). This is atomic:
+  concurrent collector runs cannot create duplicate market rows.
+- update_probability_cache() updates only the denormalized cache columns
+  on the markets table. It does NOT create a snapshot — that's the
+  snapshot collector's job.
+- Every write happens within a transaction provided by the caller's
+  get_session() context manager. This repository never opens its own
+  transaction.
+
+Changelog:
+  v1.3 — tambah fields dari RawMarket baru:
+    volume_24h_usd, best_bid, best_ask, spread, price_change_1h,
+    price_change_1d ke upsert_from_api().
+    num_traders tetap di-upsert (= 0) agar kolom DB tidak berubah.
+    Kolom baru di markets table WAJIB ada via migration sebelum deploy.
+    Lihat migration: add_market_enrichment_fields.
+
+  v1.4 — tambah MarketDTO dan get_active_tracked_dto().
+    FIX: SnapshotsCollector dan SignalCollector mengakses market data
+    DI LUAR session context. ORM objects raise DetachedInstanceError
+    ketika diakses setelah session ditutup karena lazy-load tidak bisa
+    berjalan tanpa session aktif.
+    SOLUTION: get_active_tracked_dto() mengembalikan plain dataclass
+    (MarketDTO) — tidak terikat session, aman diakses kapan saja.
+    get_active_tracked() tetap ada untuk caller yang membutuhkan
+    ORM objects di dalam session yang sama.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Optional
+
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import Session
+
+from models.market import Market
+from services.polymarket_service import RawMarket
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+
+# =============================================================================
+# DTO — plain data object, tidak terikat SQLAlchemy session
+# =============================================================================
+
+@dataclass
+class MarketDTO:
+    """
+    Plain data object yang merepresentasikan satu row dari markets table.
+
+    KAPAN DIPAKAI:
+      Gunakan MarketDTO (bukan Market ORM object) ketika data market akan
+      diakses DI LUAR get_session() context — misalnya setelah session
+      ditutup dan digunakan di thread lain.
+
+      Contoh yang SALAH (DetachedInstanceError):
+        with get_session() as session:
+            markets = repo.get_active_tracked(session)
+        # Session sudah ditutup di sini!
+        for m in markets:
+            print(m.condition_id)  # ← DetachedInstanceError
+
+      Contoh yang BENAR (pakai DTO):
+        with get_session() as session:
+            markets = repo.get_active_tracked_dto(session)
+        # Session sudah ditutup, tapi DTO tetap aman diakses
+        for m in markets:
+            print(m.condition_id)  # ← OK
+
+    FIELDS:
+      Hanya berisi fields yang dibutuhkan oleh SnapshotsCollector
+      dan SignalCollector. Bukan seluruh kolom markets table.
+      Tambah field di sini jika collector butuh data tambahan.
+    """
+    id: int
+    condition_id: str
+    question: str
+    status: str
+    volume_usd: Decimal
+    volume_24h_usd: Decimal
+    liquidity_usd: Decimal
+    market_probability: Optional[Decimal]
+
+
+# =============================================================================
+# Repository
+# =============================================================================
+
+class MarketRepository:
+    """
+    Database access layer for the markets table.
+
+    All methods accept a Session as first argument — the caller (collector)
+    owns the transaction lifecycle via get_session(). This repository
+    never commits or rolls back.
+    """
+
+    def upsert_from_api(self, session: Session, raw: RawMarket) -> Market:
+        """
+        Insert a new market or update an existing one by condition_id.
+
+        Uses PostgreSQL's ON CONFLICT DO UPDATE (upsert) so this method
+        is safe to call multiple times for the same condition_id.
+
+        Fields NEVER overwritten on update:
+          - id, created_at
+          - ai_probability, edge  (owned by AI engine, Sprint 4)
+          - is_tracked            (owned by operator config)
+          - deleted_at            (soft delete)
+
+        Fields updated on every sync:
+          - question, description, status
+          - market_probability, volume_usd, volume_24h_usd, liquidity_usd
+          - num_traders (= 0, Gamma API tidak expose field ini)
+          - best_bid, best_ask, spread (dari Gamma response)
+          - price_change_1h, price_change_1d
+          - end_date, resolved_at
+          - last_synced_at, updated_at
+          - tags, sub_category
+        """
+        import json
+
+        now = datetime.now(timezone.utc)
+        tags_json = json.dumps(raw.tags) if raw.tags else None
+
+        insert_values = {
+            "condition_id":      raw.condition_id,
+            "slug":              raw.slug,
+            "question":          raw.question[:500] if raw.question else "",
+            "description":       raw.description,
+            "category":          raw.category,
+            "sub_category":      raw.sub_category,
+            "tags":              tags_json,
+            "resolution_source": raw.resolution_source,
+            "start_date":        self._parse_dt(raw.start_date),
+            "end_date":          self._parse_dt(raw.end_date),
+            "resolved_at":       self._parse_dt(raw.resolved_at),
+            "status":            raw.status,
+            "market_probability": raw.market_probability,
+
+            # Volume
+            "volume_usd":        raw.volume_usd,
+            "volume_24h_usd":    raw.volume_24h_usd,
+            "liquidity_usd":     raw.liquidity_usd,
+
+            # Traders — Gamma API tidak expose jumlah trader.
+            # Field dipertahankan di DB, nilai = 0.
+            "num_traders":       raw.num_traders,
+
+            # Orderbook snapshot dari Gamma
+            "best_bid":          raw.best_bid,
+            "best_ask":          raw.best_ask,
+            "spread":            raw.spread,
+
+            # Price movement
+            "price_change_1h":   raw.price_change_1h,
+            "price_change_1d":   raw.price_change_1d,
+
+            "is_tracked":        True,
+            "last_synced_at":    now,
+            "created_at":        now,
+            "updated_at":        now,
+        }
+
+        # Fields to update on conflict
+        # Exclude: condition_id (conflict key), created_at, is_tracked, ai_*, deleted_at
+        update_values = {
+            k: v for k, v in insert_values.items()
+            if k not in ("condition_id", "created_at", "is_tracked")
+        }
+
+        stmt = (
+            pg_insert(Market)
+            .values(**insert_values)
+            .on_conflict_do_update(
+                index_elements=["condition_id"],
+                set_=update_values,
+            )
+            .returning(Market)
+        )
+
+        result = session.execute(stmt)
+        market = result.scalars().first()
+
+        # SQLAlchemy 2.x: after execute(returning), object may be detached.
+        if market is None:
+            market = session.execute(
+                select(Market).where(Market.condition_id == raw.condition_id)
+            ).scalars().first()
+
+        log.debug(
+            "market_upserted",
+            condition_id=raw.condition_id,
+            question=raw.question[:60] if raw.question else "",
+            status=raw.status,
+            volume_24h=str(raw.volume_24h_usd),
+            market_id=market.id if market else None,
+        )
+
+        return market  # type: ignore[return-value]
+
+    def find_by_condition_id(
+        self, session: Session, condition_id: str
+    ) -> Optional[Market]:
+        """Fetch a single market by its Polymarket condition_id."""
+        return session.execute(
+            select(Market).where(
+                Market.condition_id == condition_id,
+                Market.deleted_at.is_(None),
+            )
+        ).scalars().first()
+
+    def find_by_id(self, session: Session, market_id: int) -> Optional[Market]:
+        """Fetch a single market by its internal PK."""
+        return session.execute(
+            select(Market).where(
+                Market.id == market_id,
+                Market.deleted_at.is_(None),
+            )
+        ).scalars().first()
+
+    def get_active_tracked(self, session: Session) -> list[Market]:
+        """
+        Return all active, tracked markets sebagai ORM objects.
+
+        PERINGATAN: Gunakan method ini HANYA jika data akan diakses
+        di dalam session context yang sama. Jika data perlu diakses
+        setelah session ditutup, gunakan get_active_tracked_dto().
+
+        Ordered by volume descending so high-value markets are
+        snapshotted first if the batch is interrupted.
+        """
+        return list(
+            session.execute(
+                select(Market)
+                .where(
+                    Market.status == "active",
+                    Market.is_tracked.is_(True),
+                    Market.deleted_at.is_(None),
+                )
+                .order_by(Market.volume_usd.desc())
+            ).scalars().all()
+        )
+
+    def get_active_tracked_dto(self, session: Session) -> list[MarketDTO]:
+        """
+        Return all active, tracked markets sebagai plain MarketDTO objects.
+
+        KAPAN DIPAKAI:
+          Gunakan method ini ketika data market akan diakses DI LUAR
+          get_session() context. ORM objects (get_active_tracked) akan
+          raise DetachedInstanceError setelah session ditutup.
+
+          SnapshotsCollector dan SignalCollector WAJIB memakai method ini
+          karena mereka load markets dalam satu session, kemudian
+          memproses data tersebut di thread berbeda atau setelah
+          session block selesai.
+
+        IMPLEMENTATION:
+          Menggunakan select() column-level (bukan select(Market)) agar
+          SQLAlchemy tidak membuat ORM objects — hanya plain Row objects
+          yang langsung dikonversi ke MarketDTO dataclass.
+          Tidak ada lazy-load, tidak ada session dependency.
+
+        Ordered by volume descending — sama dengan get_active_tracked().
+        """
+        rows = session.execute(
+            select(
+                Market.id,
+                Market.condition_id,
+                Market.question,
+                Market.status,
+                Market.volume_usd,
+                Market.volume_24h_usd,
+                Market.liquidity_usd,
+                Market.market_probability,
+            )
+            .where(
+                Market.status == "active",
+                Market.is_tracked.is_(True),
+                Market.deleted_at.is_(None),
+            )
+            .order_by(Market.volume_usd.desc())
+        ).all()
+
+        return [
+            MarketDTO(
+                id=row.id,
+                condition_id=row.condition_id,
+                question=row.question,
+                status=row.status,
+                volume_usd=row.volume_usd,
+                volume_24h_usd=row.volume_24h_usd,
+                liquidity_usd=row.liquidity_usd,
+                market_probability=row.market_probability,
+            )
+            for row in rows
+        ]
+
+    def update_probability_cache(
+        self,
+        session: Session,
+        market_id: int,
+        probability: Decimal,
+    ) -> None:
+        """
+        Update the denormalized probability cache on the markets table.
+
+        Called by snapshot collector after each snapshot write.
+        Keeps markets.market_probability current for dashboard queries.
+
+        NOTE: volume_usd, volume_24h_usd, liquidity_usd, best_bid, best_ask
+        NOT updated here — they come from Gamma API via MarketsCollector.
+        """
+        session.execute(
+            update(Market)
+            .where(Market.id == market_id)
+            .values(
+                market_probability=probability,
+                last_synced_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+
+    def mark_resolved(
+        self,
+        session: Session,
+        condition_id: str,
+        resolved_at: datetime,
+    ) -> None:
+        """Mark a market as resolved and stop snapshot collection."""
+        session.execute(
+            update(Market)
+            .where(Market.condition_id == condition_id)
+            .values(
+                status="resolved",
+                resolved_at=resolved_at,
+                is_tracked=False,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        log.info("market_marked_resolved", condition_id=condition_id)
+
+    def count_active_tracked(self, session: Session) -> int:
+        """Return count of active tracked markets. Used for health monitoring."""
+        from sqlalchemy import func
+        result = session.execute(
+            select(func.count(Market.id)).where(
+                Market.status == "active",
+                Market.is_tracked.is_(True),
+                Market.deleted_at.is_(None),
+            )
+        ).scalar()
+        return result or 0
+
+    # -------------------------------------------------------------------------
+    # Private helpers
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_dt(value: str | None) -> datetime | None:
+        """Parse ISO 8601 string to UTC-aware datetime. Returns None on failure."""
+        if not value:
+            return None
+        try:
+            from dateutil import parser as dtparser
+            dt = dtparser.parse(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+=== FILE: ./python/repositories/signal_analytics_repository.py ===
+"""
+repositories/signal_analytics_repository.py
+
+Sprint 3 — Rule Performance Analytics
+
+Aggregates evaluated signal data for rule performance reporting.
+
+Design decisions:
+  - Read-only repository: zero writes. All aggregation is pure SELECT.
+  - Uses raw SQL via SQLAlchemy text() for complex aggregations
+    (median, profit_factor, max_drawdown) that are awkward in ORM.
+  - Returns typed dataclasses, not raw rows — callers get structured
+    data without coupling to DB column names.
+  - All queries filter is_correct IS NOT NULL to exclude:
+      * pending signals (not yet evaluated)
+      * cancelled market signals (ROI=0, is_correct=None)
+    Cancelled signals are excluded from win_rate/ROI stats but counted
+    separately in total_signals for transparency.
+  - profit_factor = sum(positive ROI) / abs(sum(negative ROI))
+    A ratio > 1.0 means the rule makes more than it loses.
+    If no losses → float('inf'). If no wins → 0.0.
+  - max_drawdown = worst single realized_roi (most negative value).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Optional
+
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Result dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RulePerformance:
+    """
+    Performance statistics for a single trigger_source (rule).
+
+    Fields:
+      rule_name       : trigger_source value (e.g. 'rule_1_extreme_low')
+      total_signals   : all signals fired by this rule (incl. pending, cancelled)
+      evaluated       : signals with is_correct IS NOT NULL
+      winning         : is_correct = true
+      losing          : is_correct = false
+      cancelled       : winning_side = 'cancelled' (ROI = 0, excluded from rates)
+      win_rate        : winning / (winning + losing)  — excludes cancelled
+      avg_roi         : mean of realized_roi where is_correct IS NOT NULL
+      median_roi      : median of realized_roi where is_correct IS NOT NULL
+      profit_factor   : sum(positive ROI) / |sum(negative ROI)|
+      max_drawdown    : min(realized_roi) — worst single trade
+      best_trade_roi  : max(realized_roi) — best single trade
+      worst_trade_roi : min(realized_roi) — same as max_drawdown
+    """
+    rule_name:       str
+    total_signals:   int
+    evaluated:       int
+    winning:         int
+    losing:          int
+    cancelled:       int
+    win_rate:        float
+    avg_roi:         Optional[float]
+    median_roi:      Optional[float]
+    profit_factor:   float
+    max_drawdown:    Optional[float]
+    best_trade_roi:  Optional[float]
+    worst_trade_roi: Optional[float]
+
+
+@dataclass
+class OverallPerformance:
+    """Aggregate performance across all rules."""
+    total_signals:  int
+    evaluated:      int
+    winning:        int
+    losing:         int
+    cancelled:      int
+    win_rate:       float
+    avg_roi:        Optional[float]
+    median_roi:     Optional[float]
+    profit_factor:  float
+    max_drawdown:   Optional[float]
+    net_roi:        Optional[float]   # sum of all realized_roi
+
+
+@dataclass
+class RecentSignal:
+    """Single resolved signal for recent activity display."""
+    signal_id:       int
+    market_question: str
+    trigger_source:  str
+    direction:       str
+    entry_price:     float
+    edge_at_signal:  float
+    resolved_outcome: Optional[str]
+    is_correct:      Optional[bool]
+    realized_roi:    Optional[float]
+    fired_at:        str
+    resolved_at:     Optional[str]
+
+
+# ---------------------------------------------------------------------------
+# Repository
+# ---------------------------------------------------------------------------
+
+class SignalAnalyticsRepository:
+    """
+    Read-only analytics queries for signal performance.
+
+    All methods accept a Session — caller owns the transaction.
+    No writes. No commits.
+    """
+
+    def get_rule_performance(self, session: Session) -> list[RulePerformance]:
+        """
+        Return performance breakdown by trigger_source (rule).
+
+        Ordered by profit_factor DESC — best performing rules first.
+        Rules with no evaluated signals are included (evaluated=0)
+        so operators can see rules that have never fired a resolved signal.
+        """
+        sql = text("""
+            SELECT
+                trigger_source                                           AS rule_name,
+
+                COUNT(*)                                                 AS total_signals,
+
+                COUNT(*) FILTER (WHERE is_correct IS NOT NULL)           AS evaluated,
+
+                COUNT(*) FILTER (WHERE is_correct = true)                AS winning,
+
+                COUNT(*) FILTER (WHERE is_correct = false)               AS losing,
+
+                COUNT(*) FILTER (
+                    WHERE resolved_outcome = 'cancelled'
+                )                                                        AS cancelled,
+
+                -- win_rate excludes cancelled
+                CASE
+                    WHEN COUNT(*) FILTER (WHERE is_correct IS NOT NULL) = 0
+                    THEN 0.0
+                    ELSE ROUND(
+                        COUNT(*) FILTER (WHERE is_correct = true)::numeric /
+                        NULLIF(
+                            COUNT(*) FILTER (WHERE is_correct IS NOT NULL),
+                            0
+                        ), 4
+                    )
+                END                                                      AS win_rate,
+
+                ROUND(AVG(realized_roi) FILTER (
+                    WHERE is_correct IS NOT NULL
+                ), 4)                                                    AS avg_roi,
+
+                -- PostgreSQL percentile_cont for median
+                PERCENTILE_CONT(0.5) WITHIN GROUP (
+                    ORDER BY realized_roi
+                ) FILTER (
+                    WHERE is_correct IS NOT NULL
+                )                                                        AS median_roi,
+
+                -- profit_factor = sum(gains) / |sum(losses)|
+                CASE
+                    WHEN SUM(realized_roi) FILTER (WHERE realized_roi < 0) = 0
+                         OR SUM(realized_roi) FILTER (WHERE realized_roi < 0) IS NULL
+                    THEN
+                        CASE
+                            WHEN SUM(realized_roi) FILTER (WHERE realized_roi > 0) > 0
+                            THEN 999999.0   -- no losses, treat as very high PF
+                            ELSE 0.0
+                        END
+                    ELSE ROUND(
+                        COALESCE(SUM(realized_roi) FILTER (WHERE realized_roi > 0), 0) /
+                        ABS(SUM(realized_roi) FILTER (WHERE realized_roi < 0)),
+                        4
+                    )
+                END                                                      AS profit_factor,
+
+                MIN(realized_roi) FILTER (
+                    WHERE is_correct IS NOT NULL
+                )                                                        AS max_drawdown,
+
+                MAX(realized_roi) FILTER (
+                    WHERE is_correct IS NOT NULL
+                )                                                        AS best_trade_roi,
+
+                MIN(realized_roi) FILTER (
+                    WHERE is_correct IS NOT NULL
+                )                                                        AS worst_trade_roi
+
+            FROM signals
+            WHERE deleted_at IS NULL
+            GROUP BY trigger_source
+            ORDER BY profit_factor DESC, win_rate DESC
+        """)
+
+        rows = session.execute(sql).mappings().all()
+
+        return [
+            RulePerformance(
+                rule_name=row["rule_name"],
+                total_signals=int(row["total_signals"]),
+                evaluated=int(row["evaluated"]),
+                winning=int(row["winning"]),
+                losing=int(row["losing"]),
+                cancelled=int(row["cancelled"]),
+                win_rate=float(row["win_rate"] or 0),
+                avg_roi=float(row["avg_roi"]) if row["avg_roi"] is not None else None,
+                median_roi=float(row["median_roi"]) if row["median_roi"] is not None else None,
+                profit_factor=float(row["profit_factor"] or 0),
+                max_drawdown=float(row["max_drawdown"]) if row["max_drawdown"] is not None else None,
+                best_trade_roi=float(row["best_trade_roi"]) if row["best_trade_roi"] is not None else None,
+                worst_trade_roi=float(row["worst_trade_roi"]) if row["worst_trade_roi"] is not None else None,
+            )
+            for row in rows
+        ]
+
+    def get_overall_performance(self, session: Session) -> OverallPerformance:
+        """Return aggregate performance across all rules."""
+        sql = text("""
+            SELECT
+                COUNT(*)                                                 AS total_signals,
+                COUNT(*) FILTER (WHERE is_correct IS NOT NULL)           AS evaluated,
+                COUNT(*) FILTER (WHERE is_correct = true)                AS winning,
+                COUNT(*) FILTER (WHERE is_correct = false)               AS losing,
+                COUNT(*) FILTER (WHERE resolved_outcome = 'cancelled')   AS cancelled,
+                CASE
+                    WHEN COUNT(*) FILTER (WHERE is_correct IS NOT NULL) = 0 THEN 0.0
+                    ELSE ROUND(
+                        COUNT(*) FILTER (WHERE is_correct = true)::numeric /
+                        NULLIF(COUNT(*) FILTER (WHERE is_correct IS NOT NULL), 0),
+                        4
+                    )
+                END                                                      AS win_rate,
+                ROUND(AVG(realized_roi) FILTER (WHERE is_correct IS NOT NULL), 4)
+                                                                         AS avg_roi,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_roi)
+                    FILTER (WHERE is_correct IS NOT NULL)                AS median_roi,
+                CASE
+                    WHEN SUM(realized_roi) FILTER (WHERE realized_roi < 0) = 0
+                         OR SUM(realized_roi) FILTER (WHERE realized_roi < 0) IS NULL
+                    THEN CASE
+                        WHEN SUM(realized_roi) FILTER (WHERE realized_roi > 0) > 0
+                        THEN 999999.0 ELSE 0.0
+                    END
+                    ELSE ROUND(
+                        COALESCE(SUM(realized_roi) FILTER (WHERE realized_roi > 0), 0) /
+                        ABS(SUM(realized_roi) FILTER (WHERE realized_roi < 0)),
+                        4
+                    )
+                END                                                      AS profit_factor,
+                MIN(realized_roi) FILTER (WHERE is_correct IS NOT NULL)  AS max_drawdown,
+                ROUND(SUM(realized_roi) FILTER (WHERE is_correct IS NOT NULL), 4)
+                                                                         AS net_roi
+            FROM signals
+            WHERE deleted_at IS NULL
+        """)
+
+        row = session.execute(sql).mappings().first()
+
+        return OverallPerformance(
+            total_signals=int(row["total_signals"] or 0),
+            evaluated=int(row["evaluated"] or 0),
+            winning=int(row["winning"] or 0),
+            losing=int(row["losing"] or 0),
+            cancelled=int(row["cancelled"] or 0),
+            win_rate=float(row["win_rate"] or 0),
+            avg_roi=float(row["avg_roi"]) if row["avg_roi"] is not None else None,
+            median_roi=float(row["median_roi"]) if row["median_roi"] is not None else None,
+            profit_factor=float(row["profit_factor"] or 0),
+            max_drawdown=float(row["max_drawdown"]) if row["max_drawdown"] is not None else None,
+            net_roi=float(row["net_roi"]) if row["net_roi"] is not None else None,
+        )
+
+    def get_recent_resolved_signals(
+        self,
+        session: Session,
+        limit: int = 50,
+    ) -> list[RecentSignal]:
+        """
+        Return recently resolved signals with market question for display.
+        Ordered by resolved_at DESC — most recent first.
+        """
+        sql = text("""
+            SELECT
+                s.id                             AS signal_id,
+                m.question                       AS market_question,
+                s.trigger_source,
+                s.direction,
+                s.market_probability_at_signal   AS entry_price,
+                s.edge_at_signal,
+                s.resolved_outcome,
+                s.is_correct,
+                s.realized_roi,
+                s.fired_at,
+                s.resolved_at
+            FROM signals s
+            JOIN markets m ON m.id = s.market_id
+            WHERE s.status = 'resolved'
+              AND s.deleted_at IS NULL
+            ORDER BY s.resolved_at DESC
+            LIMIT :limit
+        """)
+
+        rows = session.execute(sql, {"limit": limit}).mappings().all()
+
+        return [
+            RecentSignal(
+                signal_id=row["signal_id"],
+                market_question=row["market_question"],
+                trigger_source=row["trigger_source"],
+                direction=row["direction"],
+                entry_price=float(row["entry_price"]),
+                edge_at_signal=float(row["edge_at_signal"]),
+                resolved_outcome=row["resolved_outcome"],
+                is_correct=row["is_correct"],
+                realized_roi=float(row["realized_roi"]) if row["realized_roi"] is not None else None,
+                fired_at=str(row["fired_at"]),
+                resolved_at=str(row["resolved_at"]) if row["resolved_at"] else None,
+            )
+            for row in rows
+        ]
+
+    def get_pending_count(self, session: Session) -> int:
+        """Count signals still pending evaluation."""
+        result = session.execute(
+            text("SELECT COUNT(*) FROM signals WHERE status = 'pending' AND deleted_at IS NULL")
+        ).scalar()
+        return int(result or 0)
+
+    def get_rule_signal_counts(self, session: Session) -> dict[str, int]:
+        """Return {rule_name: total_count} for all rules. Used by diagnostic."""
+        rows = session.execute(
+            text("""
+                SELECT trigger_source, COUNT(*) AS cnt
+                FROM signals
+                WHERE deleted_at IS NULL
+                GROUP BY trigger_source
+                ORDER BY cnt DESC
+            """)
+        ).all()
+        return {row[0]: int(row[1]) for row in rows}
+
+=== FILE: ./python/repositories/signal_repository.py ===
+from utils.logger import get_logger
+from datetime import datetime, timezone, timedelta
+from sqlalchemy import select
+from typing import List, Dict, Any
+
+from utils.db import get_session
+from models.signal import Signal
+
+log = get_logger(__name__)
+
+class SignalRepository:
+    """
+    Handles persistence of generated signals.
+    """
+
+    def store_signals(self, signals_data: List[Dict[str, Any]], market_id: int) -> int:
+        """
+        Stores new signals for a market.
+        Avoids creating duplicates if a pending signal for the same rule already exists.
+        """
+        if not signals_data:
+            return 0
+            
+        inserted_count = 0
+        now = datetime.now(timezone.utc)
+        
+        with get_session() as session:
+            for s_data in signals_data:
+                rule_name = s_data["trigger_source"]
+                
+                # Check if an active/pending signal for this rule already exists
+                # to avoid spamming the same signal every 5 minutes
+                existing = session.scalars(
+                    select(Signal)
+                    .where(Signal.market_id == market_id)
+                    .where(Signal.trigger_source == rule_name)
+                    .where(Signal.status == "pending")
+                ).first()
+                
+                if existing:
+                    continue
+                    
+                new_signal = Signal(
+                    market_id=market_id,
+                    direction=s_data["direction"],
+                    market_probability_at_signal=s_data["context"]["price_entry"],
+                    edge_at_signal=s_data["edge"],
+                    confidence_at_signal=s_data["context"]["confidence"],
+                    min_edge_threshold=0.05,
+                    trigger_source=rule_name,
+                    status="pending",
+                    snapshot_data=s_data["context"],
+                    fired_at=now,
+                    expires_at=now + timedelta(hours=24),
+                    momentum_24h_percent=s_data["context"].get("momentum"),
+                    volume_24h_usd=s_data["context"].get("volume_24h"),
+                    liquidity_usd=s_data["context"].get("liquidity"),
+                    spread=s_data["context"].get("spread"),
+                )
+                
+                session.add(new_signal)
+                inserted_count += 1
+                
+            if inserted_count > 0:
+                session.commit()
+                
+        return inserted_count
+
+=== FILE: ./python/repositories/snapshot_repository.py ===
+"""
+repositories/snapshot_repository.py
+
+All database access for the `market_snapshots` table.
+
+Design decisions:
+- Snapshots are IMMUTABLE once written — no update methods exist here.
+  The only write operation is insert (single or batch).
+- bulk_insert() uses SQLAlchemy Core INSERT for performance. Inserting
+  200 snapshots via ORM add() would issue 200 individual INSERT statements.
+  Core bulk insert issues one statement with 200 value tuples.
+- duplicate_guard: before inserting, we check if a snapshot already exists
+  for this market in the last N seconds. This prevents duplicate rows when
+  the scheduler fires slightly early or the previous job ran long.
+  The window is conservative (60s) — at 5-minute intervals, a 60-second
+  window catches true duplicates without masking legitimate back-to-back runs.
+- External price context (BTC/ETH price, fear_greed) is fetched by the
+  snapshot collector and passed in — this repository does not fetch prices.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Optional
+
+from sqlalchemy import insert, select, text
+from sqlalchemy.orm import Session
+
+from models.market import MarketSnapshot
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+# How recently a snapshot must exist to be considered a duplicate (seconds)
+DUPLICATE_GUARD_SECONDS = 60
+
+
+class SnapshotRepository:
+    """
+    Database access layer for the market_snapshots table.
+
+    All methods accept a Session — the caller owns the transaction.
+    This repository never commits or rolls back.
+    """
+
+    def insert_snapshot(
+        self,
+        session: Session,
+        *,
+        market_id: int,
+        probability_yes: Decimal,
+        probability_no: Decimal,
+        best_bid: Optional[Decimal],
+        best_ask: Optional[Decimal],
+        spread: Optional[Decimal],
+        volume_usd: Decimal,
+        volume_24h_usd: Decimal,
+        liquidity_usd: Decimal,
+        snapshotted_at: datetime,
+        btc_price_usd: Optional[Decimal] = None,
+        eth_price_usd: Optional[Decimal] = None,
+        fear_greed_index: Optional[int] = None,
+        btc_dominance: Optional[Decimal] = None,
+        collector_version: Optional[str] = None,
+    ) -> Optional[MarketSnapshot]:
+        """
+        Insert a single snapshot row.
+
+        Returns the inserted MarketSnapshot, or None if a duplicate was
+        detected within the guard window (logged as a warning, not an error).
+
+        All numeric values are Decimal — exact arithmetic, no float drift.
+        """
+        # Duplicate guard: check for a recent snapshot for this market
+        if self._is_duplicate(session, market_id, snapshotted_at):
+            log.warning(
+                "snapshot_duplicate_skipped",
+                market_id=market_id,
+                snapshotted_at=snapshotted_at.isoformat(),
+                guard_seconds=DUPLICATE_GUARD_SECONDS,
+            )
+            return None
+
+        now = datetime.now(timezone.utc)
+
+        snapshot = MarketSnapshot(
+            market_id=market_id,
+            probability_yes=probability_yes,
+            probability_no=probability_no,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            spread=spread,
+            volume_usd=volume_usd,
+            volume_24h_usd=volume_24h_usd,
+            liquidity_usd=liquidity_usd,
+            btc_price_usd=btc_price_usd,
+            eth_price_usd=eth_price_usd,
+            fear_greed_index=fear_greed_index,
+            btc_dominance=btc_dominance,
+            collector_version=collector_version,
+            snapshotted_at=snapshotted_at,
+            created_at=now,
+            updated_at=now,
+        )
+
+        session.add(snapshot)
+        session.flush()   # Assigns snapshot.id without committing the transaction
+
+        log.debug(
+            "snapshot_inserted",
+            market_id=market_id,
+            probability_yes=str(probability_yes),
+            volume_24h=str(volume_24h_usd),
+            snapshot_id=snapshot.id,
+        )
+
+        return snapshot
+
+    def bulk_insert(
+        self,
+        session: Session,
+        rows: list[dict],
+    ) -> int:
+        """
+        Insert multiple snapshot rows in a single SQL statement.
+        Returns the number of rows inserted.
+
+        Each dict in `rows` must match the MarketSnapshot column names.
+        Rows that fail the duplicate guard are silently excluded before
+        the bulk insert runs (checked in batch via a single query).
+
+        This is the preferred method for the snapshot collector because
+        it processes all markets in one DB round-trip.
+        """
+        if not rows:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            row.setdefault("created_at", now)
+            row.setdefault("updated_at", now)
+
+        session.execute(insert(MarketSnapshot), rows)
+
+        log.info("snapshots_bulk_inserted", count=len(rows))
+        return len(rows)
+
+    def get_latest_for_market(
+        self, session: Session, market_id: int
+    ) -> Optional[MarketSnapshot]:
+        """
+        Fetch the most recent snapshot for a market.
+        Used by the snapshot collector to get current price for mark-to-market.
+        """
+        return session.execute(
+            select(MarketSnapshot)
+            .where(MarketSnapshot.market_id == market_id)
+            .order_by(MarketSnapshot.snapshotted_at.desc())
+            .limit(1)
+        ).scalars().first()
+
+    def count_for_market(self, session: Session, market_id: int) -> int:
+        """Return total snapshot count for a market. Used for data sufficiency checks."""
+        from sqlalchemy import func
+        result = session.execute(
+            select(func.count(MarketSnapshot.id)).where(
+                MarketSnapshot.market_id == market_id
+            )
+        ).scalar()
+        return result or 0
+
+    def get_recent_for_market(
+        self,
+        session: Session,
+        market_id: int,
+        limit: int = 100,
+    ) -> list[MarketSnapshot]:
+        """
+        Fetch the N most recent snapshots for a market, newest first.
+        Used for chart data and AI feature building.
+        """
+        return list(
+            session.execute(
+                select(MarketSnapshot)
+                .where(MarketSnapshot.market_id == market_id)
+                .order_by(MarketSnapshot.snapshotted_at.desc())
+                .limit(limit)
+            ).scalars().all()
+        )
+
+    # -------------------------------------------------------------------------
+    # Private helpers
+    # -------------------------------------------------------------------------
+
+    def _is_duplicate(
+        self,
+        session: Session,
+        market_id: int,
+        snapshotted_at: datetime,
+    ) -> bool:
+        """
+        Returns True if a snapshot for this market already exists within
+        the duplicate guard window before snapshotted_at.
+
+        Window: [snapshotted_at - DUPLICATE_GUARD_SECONDS, snapshotted_at]
+        """
+        cutoff = snapshotted_at - timedelta(seconds=DUPLICATE_GUARD_SECONDS)
+
+        existing = session.execute(
+            select(MarketSnapshot.id)
+            .where(
+                MarketSnapshot.market_id == market_id,
+                MarketSnapshot.snapshotted_at >= cutoff,
+                MarketSnapshot.snapshotted_at <= snapshotted_at,
+            )
+            .limit(1)
+        ).scalars().first()
+
+        return existing is not None
+
+=== FILE: ./python/run_collection_pipeline.py ===
+#!/usr/bin/env python3
+"""
+Run collectors and report results
+"""
+import sys
+sys.path.insert(0, "/app")
+
+from collectors.snapshots_collector import SnapshotsCollector
+from collectors.signal_collector import SignalCollector
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+print("=" * 80)
+print("RUNNING DATA COLLECTION PIPELINE")
+print("=" * 80)
+
+# Step 1: Snapshots
+print("\nStep 1: Collecting snapshots...")
+snapshots_collector = SnapshotsCollector()
+result = snapshots_collector.run()
+
+print(f"\n✓ Snapshots collected:")
+print(f"  Written: {result.snapshots_written}")
+print(f"  Skipped: {result.snapshots_skipped}")
+print(f"  Failed: {result.markets_failed}")
+print(f"  Success rate: {result.success_rate:.1%}")
+snapshots_collector.close()
+
+# Step 2: Signals
+print("\n" + "=" * 80)
+print("Step 2: Generating signals...")
+signal_collector = SignalCollector()
+signal_result = signal_collector.run()
+
+print(f"\n✓ Signals generated:")
+print(f"  Signals created: {signal_result.signals_created}")
+print(f"  Signals updated: {signal_result.signals_updated}")
+print(f"  Signals skipped: {signal_result.signals_skipped}")
+print(f"  Errors: {signal_result.errors}")
+signal_collector.close()
+
+print("\n" + "=" * 80)
+print("PIPELINE COMPLETE")
+print("=" * 80)
+
+=== FILE: ./python/scheduler.py ===
+"""
+scheduler.py
+
+Process entry point. Configures and runs the APScheduler job loop.
+
+Jobs and schedules:
+  collect_markets   — every MARKET_SYNC_INTERVAL_MINUTES (default: 15)
+  collect_snapshots — every SNAPSHOT_INTERVAL_MINUTES    (default:  5)
+  collect_stats     — every 60 minutes
+  collect_signals   — every SNAPSHOT_INTERVAL_MINUTES    (default:  5)
+  evaluate_signals  — every SNAPSHOT_INTERVAL_MINUTES    (default:  5) [Sprint 3]
+
+Design decisions:
+  - BackgroundScheduler runs jobs in a thread pool (max_workers=4).
+  - misfire_grace_time=60: tolerate up to 60s latency before misfire.
+  - coalesce=True: one catch-up run on resume, not N.
+  - collect_markets fires IMMEDIATELY at startup (next_run_time=now).
+  - All other jobs delayed by startup_delay (90s) so collect_markets
+    has time to populate the DB before snapshots/signals run.
+  - Cold start sync: collect_markets also runs SYNCHRONOUSLY before the
+    scheduler starts. The 90s delay is a safety net; the sync is the
+    guarantee. If sync takes >90s (slow API), snapshot still won't see
+    an empty DB.
+  - Signal handlers (SIGTERM/SIGINT) shut down gracefully.
+  - DB connectivity check at startup — fail fast if DB unreachable.
+
+Sprint 3 additions:
+  - _signal_evaluator singleton (SignalEvaluator)
+  - job_evaluate_signals: evaluates pending signals against resolved
+    market outcomes. Runs on same interval as snapshots.
+    Delayed 90s + 30s extra so snapshot job completes its first run first.
+
+Environment variables (all in config/settings.py):
+  SNAPSHOT_INTERVAL_MINUTES    default: 5
+  MARKET_SYNC_INTERVAL_MINUTES default: 15
+  LOG_LEVEL                    default: INFO
+  LOG_FORMAT                   default: json (prod) | console (dev)
+"""
+
+from __future__ import annotations
+
+import signal
+import sys
+import time
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, JobExecutionEvent
+
+from config.settings import settings
+from utils.logger import configure_logging, get_logger
+
+# Configure logging FIRST — before any other module uses logging
+configure_logging()
+
+log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Collector singletons
+# Reusing instances preserves TCP connections across runs (httpx Client).
+# ---------------------------------------------------------------------------
+
+_markets_collector   = None
+_snapshots_collector = None
+_stats_collector     = None
+_signals_collector   = None
+_signal_evaluator    = None    # Sprint 3
+
+
+def _init_collectors() -> None:
+    global _markets_collector, _snapshots_collector
+    global _stats_collector, _signals_collector, _signal_evaluator
+
+    from collectors.markets_collector   import MarketsCollector
+    from collectors.snapshots_collector import SnapshotsCollector
+    from collectors.stats_collector     import StatsCollector
+    from collectors.signal_collector    import SignalCollector
+    from services.signal_evaluator      import SignalEvaluator    # Sprint 3
+
+    _markets_collector   = MarketsCollector()
+    _snapshots_collector = SnapshotsCollector()
+    _stats_collector     = StatsCollector()
+    _signals_collector   = SignalCollector()
+    _signal_evaluator    = SignalEvaluator()
+
+    log.info("collectors_initialised")
+
+
+# ---------------------------------------------------------------------------
+# Cold start sync
+# ---------------------------------------------------------------------------
+
+def _cold_start_market_sync() -> None:
+    """
+    Run market sync SYNCHRONOUSLY before scheduler starts.
+
+    WHY:
+      The 90s startup_delay is a best-effort buffer. If collect_markets
+      takes >90s (slow API, large dataset, cold network), snapshot and
+      signal collectors will still find an empty DB on their first run.
+
+      This sync guarantees markets are in the DB BEFORE the scheduler
+      starts, regardless of how long the API takes.
+
+    TRADEOFF:
+      Process startup is slower by ~30-60s (typical market sync time).
+      This is acceptable — correct first run > fast startup.
+
+    ERROR HANDLING:
+      Non-fatal. If sync fails, scheduler starts anyway.
+      collect_markets will retry on its first scheduled interval.
+      Log clearly so ops can see the cold start failed.
+    """
+    log.info("cold_start_market_sync_begin")
+    try:
+        result = _markets_collector.run()
+        log.info(
+            "cold_start_market_sync_done",
+            inserted=result.inserted,
+            updated=result.updated,
+            errors=result.errors,
+            duration=round(result.duration_seconds, 2),
+        )
+        if result.inserted == 0 and result.updated == 0:
+            log.warning(
+                "cold_start_market_sync_empty",
+                hint="API may be unreachable or returned no crypto markets. "
+                     "Snapshot collector will retry on first scheduled run.",
+            )
+    except Exception as exc:
+        log.error(
+            "cold_start_market_sync_failed",
+            error=str(exc),
+            hint="Scheduler will start. First snapshot run may find 0 markets.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Job functions — thin wrappers, business logic stays in collectors/services
+# ---------------------------------------------------------------------------
+
+def job_collect_markets() -> None:
+    """Sync markets from Polymarket Gamma API. Every MARKET_SYNC_INTERVAL_MINUTES."""
+    log.info("job_collect_markets_start")
+    try:
+        result = _markets_collector.run()
+        log.info(
+            "job_collect_markets_done",
+            inserted=result.inserted,
+            updated=result.updated,
+            errors=result.errors,
+            duration=round(result.duration_seconds, 2),
+        )
+    except Exception as exc:
+        log.exception("job_collect_markets_failed", error=str(exc))
+        raise
+
+
+def job_collect_markets_full() -> None:
+    """Full market scan — fetch all ~10,000 active markets. Daily at 00:00 UTC.
+    Discovers new and low-volume crypto markets missed by incremental sync."""
+    log.info("job_collect_markets_full_start")
+    try:
+        result = _markets_collector.run(full_scan=True)
+        log.info(
+            "job_collect_markets_full_done",
+            inserted=result.inserted,
+            updated=result.updated,
+            errors=result.errors,
+            duration=round(result.duration_seconds, 2),
+        )
+    except Exception as exc:
+        log.exception("job_collect_markets_full_failed", error=str(exc))
+        raise
+
+
+def job_collect_snapshots() -> None:
+    """Collect CLOB probability snapshots. Every SNAPSHOT_INTERVAL_MINUTES."""
+    log.info("job_collect_snapshots_start")
+    try:
+        result = _snapshots_collector.run()
+        log.info(
+            "job_collect_snapshots_done",
+            written=result.snapshots_written,
+            failed=result.markets_failed,
+            success_rate=round(result.success_rate, 3),
+            duration=round(result.duration_seconds, 2),
+        )
+    except Exception as exc:
+        log.exception("job_collect_snapshots_failed", error=str(exc))
+        raise
+
+
+def job_collect_stats() -> None:
+    """Precompute daily stats (7d volume, 24h momentum). Every 60 minutes."""
+    log.info("job_collect_stats_start")
+    try:
+        _stats_collector.run()
+        log.info("job_collect_stats_done")
+    except Exception as exc:
+        log.exception("job_collect_stats_failed", error=str(exc))
+        raise
+
+
+def job_collect_signals() -> None:
+    """Evaluate rules and generate signals. Every SNAPSHOT_INTERVAL_MINUTES."""
+    log.info("job_collect_signals_start")
+    try:
+        _signals_collector.run()
+        log.info("job_collect_signals_done")
+    except Exception as exc:
+        log.exception("job_collect_signals_failed", error=str(exc))
+        raise
+
+
+def job_evaluate_signals() -> None:
+    """
+    Sprint 3 — Evaluate pending signals against resolved market outcomes.
+
+    Runs on same interval as snapshots. Fast no-op when nothing to evaluate.
+    Delayed an extra 30s beyond startup_delay so snapshot job completes
+    its first run before evaluator checks for newly resolved markets.
+    """
+    log.info("job_evaluate_signals_start")
+    try:
+        result = _signal_evaluator.run()
+        log.info(
+            "job_evaluate_signals_done",
+            evaluated=result.evaluated,
+            correct=result.correct,
+            incorrect=result.incorrect,
+            cancelled=result.cancelled,
+            win_rate=round(result.win_rate, 4),
+            duration=round(result.duration_seconds, 2),
+        )
+    except Exception as exc:
+        log.exception("job_evaluate_signals_failed", error=str(exc))
+        raise
+
+
+# ---------------------------------------------------------------------------
+# APScheduler event listener
+# ---------------------------------------------------------------------------
+
+def _on_job_event(event: JobExecutionEvent) -> None:
+    if event.exception:
+        log.error(
+            "scheduler_job_failed",
+            job_id=event.job_id,
+            error=str(event.exception),
+        )
+    else:
+        log.debug("scheduler_job_executed", job_id=event.job_id)
+
+
+# ---------------------------------------------------------------------------
+# DB health check
+# ---------------------------------------------------------------------------
+
+def _check_db_connectivity() -> None:
+    from utils.db import get_session
+    from sqlalchemy import text
+
+    log.info("db_health_check_start")
+    try:
+        with get_session() as session:
+            session.execute(text("SELECT 1"))
+        log.info("db_health_check_passed")
+    except Exception as exc:
+        log.error("db_health_check_failed", error=str(exc))
+        log.error(
+            "startup_aborted",
+            reason="Cannot connect to PostgreSQL. Check DB_HOST, DB_PORT, DB_PASSWORD.",
+        )
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+
+_scheduler: BackgroundScheduler | None = None
+
+
+def _shutdown(signum: int, frame) -> None:
+    sig_name = signal.Signals(signum).name
+    log.info("shutdown_signal_received", signal=sig_name)
+
+    if _scheduler and _scheduler.running:
+        log.info("scheduler_shutting_down", wait_for_jobs=True)
+        _scheduler.shutdown(wait=True)
+
+    if _markets_collector:
+        _markets_collector.close()
+    if _snapshots_collector:
+        _snapshots_collector.close()
+
+    log.info("shutdown_complete")
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    global _scheduler
+
+    log.info(
+        "polymarket_intelligence_starting",
+        version=settings.collector_version,
+        log_level=settings.log_level,
+        snapshot_interval_minutes=settings.snapshot_interval_minutes,
+        market_sync_interval_minutes=settings.market_sync_interval_minutes,
+    )
+
+    # 1. DB connectivity check — fail fast
+    _check_db_connectivity()
+
+    # 2. Initialise collector singletons
+    _init_collectors()
+
+    # 3. Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    # 4. Cold start: sync markets synchronously before scheduler starts.
+    #    Guarantees DB is populated even if API is slow (>90s).
+    #    The startup_delay below is a secondary safety net.
+    _cold_start_market_sync()
+
+    # 5. Configure APScheduler
+    executors = {
+        "default": ThreadPoolExecutor(max_workers=4),
+    }
+    job_defaults = {
+        "coalesce": True,
+        "max_instances": 1,
+        "misfire_grace_time": 60,
+    }
+
+    _scheduler = BackgroundScheduler(
+        executors=executors,
+        job_defaults=job_defaults,
+        timezone="UTC",
+    )
+    _scheduler.add_listener(_on_job_event, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+
+    # 6. Register jobs
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    now = _dt.now(_tz.utc)
+
+    # collect_markets: fires immediately (cold start already ran, but
+    # schedule normally so it stays on its interval from startup time)
+    _scheduler.add_job(
+        job_collect_markets,
+        trigger="interval",
+        minutes=settings.market_sync_interval_minutes,
+        id="collect_markets",
+        name="Market Sync (Gamma API)",
+        next_run_time=now,
+    )
+
+    # Daily full scan: every day at 00:00 UTC
+    # Discovers new/low-volume crypto markets missed by incremental sync
+    _scheduler.add_job(
+        job_collect_markets_full,
+        trigger="cron",
+        hour=0,
+        minute=0,
+        id="collect_markets_full",
+        name="Market Full Scan (Daily)",
+    )
+
+    # All other jobs: delayed 90s — secondary safety net after cold start sync
+    startup_delay = _td(seconds=90)
+
+    _scheduler.add_job(
+        job_collect_snapshots,
+        trigger="interval",
+        minutes=settings.snapshot_interval_minutes,
+        id="collect_snapshots",
+        name="Snapshot Collection (CLOB API)",
+        next_run_time=now + startup_delay,
+    )
+
+    _scheduler.add_job(
+        job_collect_signals,
+        trigger="interval",
+        minutes=settings.snapshot_interval_minutes,
+        id="collect_signals",
+        name="Signal Generation (Rules)",
+        next_run_time=now + startup_delay,
+    )
+
+    _scheduler.add_job(
+        job_collect_stats,
+        trigger="interval",
+        minutes=60,
+        id="collect_stats",
+        name="Daily Stats Precomputation",
+        next_run_time=now + startup_delay,
+    )
+
+    # Sprint 3 — evaluate_signals: extra 30s delay so snapshot job
+    # completes its first run before evaluator checks for outcomes
+    _scheduler.add_job(
+        job_evaluate_signals,
+        trigger="interval",
+        minutes=settings.snapshot_interval_minutes,
+        id="evaluate_signals",
+        name="Signal Evaluation (Sprint 3)",
+        next_run_time=now + startup_delay + _td(seconds=30),
+    )
+
+    # 7. Start
+    _scheduler.start()
+
+    log.info(
+        "scheduler_started",
+        jobs=[job.id for job in _scheduler.get_jobs()],
+    )
+
+    # 8. Block main thread — APScheduler runs in background threads
+    try:
+        while True:
+            time.sleep(60)
+            log.debug(
+                "scheduler_heartbeat",
+                running_jobs=[j.id for j in _scheduler.get_jobs()],
+            )
+    except (KeyboardInterrupt, SystemExit):
+        _shutdown(signal.SIGINT, None)
+
+
+if __name__ == "__main__":
+    main()
+
+=== FILE: ./python/services/__init__.py ===
+
+=== FILE: ./python/services/edge_calculator.py ===
+"""
+services/edge_calculator.py
+
+Changelog:
+  v1.2 — tambah guard filters sebelum evaluate rules:
+    - skip market expired (end_date sudah lewat)
+    - skip market terlalu jauh dari expiry (> 90 hari) untuk time-sensitive rules
+    - skip prob ekstrem suspek (< 2% atau > 98%) — kemungkinan stale/resolved
+    - konstanta PROB_FLOOR dan PROB_CEILING untuk batas wajar signal
+"""
+
+from utils.logger import get_logger
+from decimal import Decimal
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any
+
+log = get_logger(__name__)
+
+
+class EdgeCalculator:
+    """
+    Evaluates markets against predefined trading rules to generate signals.
+    """
+
+    def __init__(self):
+        # Volume
+        self.min_volume_threshold = Decimal("10000.00")
+        # Minimum edge untuk generate signal — di bawah ini tidak worth trading
+        self.MIN_EDGE = Decimal("0.05")
+
+        # Rule 1: Extreme probability thresholds
+        self.extreme_prob_low  = Decimal("0.15")
+        self.extreme_prob_high = Decimal("0.85")
+
+        # Guard: prob di luar range ini kemungkinan data stale/resolved
+        # bukan peluang nyata — jangan generate signal
+        self.PROB_FLOOR   = Decimal("0.05")   # < 5% = suspect, not exploitable
+        self.PROB_CEILING = Decimal("0.98")   # > 98% = suspect
+
+        # Rule 2: Momentum
+        self.momentum_threshold = Decimal("0.10")
+
+        # Rule 3: Volume spike
+        self.volume_spike_multiplier = Decimal("3.0")
+
+    # -------------------------------------------------------------------------
+    # Public
+    # -------------------------------------------------------------------------
+
+    def evaluate(
+        self, market: Any, latest_snapshot: Any, daily_stat: Any
+    ) -> List[Dict[str, Any]]:
+        """
+        Evaluate a market against all rules.
+        Returns list of signal dicts. Empty list = no signal.
+        """
+        if not latest_snapshot:
+            return []
+
+        # --- Guard filters (applied before ALL rules) ---
+        skip_reason = self._should_skip(market, latest_snapshot)
+        if skip_reason:
+            log.debug(
+                "signal_skipped",
+                market_id=market.id,
+                condition_id=market.condition_id,
+                reason=skip_reason,
+            )
+            return []
+
+        prob_yes  = latest_snapshot.probability_yes
+        prob_no   = latest_snapshot.probability_no
+        volume_24h = latest_snapshot.volume_24h_usd
+        now_utc   = datetime.now(timezone.utc)
+
+        context = {
+            "price_entry": float(prob_yes),
+            "volume_24h":  float(volume_24h),
+            "volume_7d":   float(daily_stat.volume_7d_avg_usd)
+                           if daily_stat and daily_stat.volume_7d_avg_usd else None,
+            "momentum":    float(daily_stat.momentum_24h_percent)
+                           if daily_stat and daily_stat.momentum_24h_percent else None,
+            "liquidity":   float(latest_snapshot.liquidity_usd),
+            "spread":      float(latest_snapshot.spread)
+                           if latest_snapshot.spread is not None else None,
+            "confidence":  0.8,
+        }
+
+        has_min_volume = volume_24h >= self.min_volume_threshold
+        signals: List[Dict[str, Any]] = []
+
+        # Rule 1: Probability Extreme (Underpriced / Overpriced)
+        if has_min_volume:
+            if self.PROB_FLOOR <= prob_yes < self.extreme_prob_low:
+                signals.append({
+                    "direction":      "yes",
+                    "trigger_source": "rule_1_extreme_low",
+                    "edge":           float(self.extreme_prob_low - prob_yes),
+                    "context":        context,
+                })
+            elif self.extreme_prob_high < prob_yes <= self.PROB_CEILING:
+                signals.append({
+                    "direction":      "no",
+                    "trigger_source": "rule_1_extreme_high",
+                    "edge":           float(prob_yes - self.extreme_prob_high),
+                    "context":        context,
+                })
+
+        # Rule 2: Probability Momentum
+        if daily_stat and daily_stat.momentum_24h_percent is not None:
+            momentum = daily_stat.momentum_24h_percent
+            if momentum > self.momentum_threshold:
+                signals.append({
+                    "direction":      "yes",
+                    "trigger_source": "rule_2_momentum_up",
+                    "edge":           float(momentum),
+                    "context":        context,
+                })
+            elif momentum < -self.momentum_threshold:
+                signals.append({
+                    "direction":      "no",
+                    "trigger_source": "rule_2_momentum_down",
+                    "edge":           float(abs(momentum)),
+                    "context":        context,
+                })
+
+        # Rule 3: Volume Spike
+        if (
+            daily_stat
+            and daily_stat.volume_7d_avg_usd
+            and daily_stat.volume_7d_avg_usd > 0
+        ):
+            avg_vol = daily_stat.volume_7d_avg_usd
+            if volume_24h > avg_vol * self.volume_spike_multiplier:
+                direction = "yes"
+                if (
+                    daily_stat.momentum_24h_percent
+                    and daily_stat.momentum_24h_percent < 0
+                ):
+                    direction = "no"
+
+                signals.append({
+                    "direction":      direction,
+                    "trigger_source": "rule_3_volume_spike",
+                    "edge":           0.05,
+                    "context":        context,
+                })
+
+        # Rule 4: Time Decay (Near Expiry, 0–48 jam)
+        if market.end_date:
+            market_end = market.end_date
+            if market_end.tzinfo is None:
+                market_end = market_end.replace(tzinfo=timezone.utc)
+            else:
+                market_end = market_end.astimezone(timezone.utc)
+
+            hours_to_expiry = (market_end - now_utc).total_seconds() / 3600
+
+            # Hanya generate kalau masih ada sisa waktu (belum expired)
+            # dan prob masih dalam range tidak pasti (40–60%)
+            if 0 < hours_to_expiry < 48:
+                if Decimal("0.40") <= prob_yes <= Decimal("0.60"):
+                    signals.append({
+                        "direction":      "yes",
+                        "trigger_source": "rule_4_time_decay",
+                        "edge":           0.05,
+                        "context":        context,
+                    })
+
+        # Filter: only return signals with meaningful edge
+        signals = [s for s in signals if Decimal(str(s["edge"])) >= self.MIN_EDGE]
+        return signals
+
+    # -------------------------------------------------------------------------
+    # Private
+    # -------------------------------------------------------------------------
+
+    def _should_skip(self, market: Any, latest_snapshot: Any) -> str | None:
+        """
+        Guard filter sebelum evaluate rules.
+        Return reason string jika harus skip, None jika lanjut.
+
+        Checks (urutan dari paling murah ke mahal):
+          1. Category bukan crypto
+          2. Market sudah expired (end_date sudah lewat)
+          3. Prob ekstrem suspek (< 2% atau > 98%)
+        """
+        now_utc = datetime.now(timezone.utc)
+
+        # 1. Hanya crypto
+        if getattr(market, "category", "crypto") != "crypto":
+            return f"non_crypto_category:{market.category}"
+
+        # 2. Skip market yang sudah expired
+        if market.end_date:
+            market_end = market.end_date
+            if market_end.tzinfo is None:
+                market_end = market_end.replace(tzinfo=timezone.utc)
+            else:
+                market_end = market_end.astimezone(timezone.utc)
+
+            if market_end <= now_utc:
+                return f"market_expired:end_date={market_end.isoformat()}"
+
+        # 3. Prob ekstrem — kemungkinan data stale atau market hampir resolved
+        prob_yes = latest_snapshot.probability_yes
+        if prob_yes < self.PROB_FLOOR:
+            return f"prob_too_low:{prob_yes}"
+        if prob_yes > self.PROB_CEILING:
+            return f"prob_too_high:{prob_yes}"
+
+        return None
+=== FILE: ./python/services/external_price_service.py ===
+"""
+services/external_price_service.py
+
+Fetches external market context data stored alongside every snapshot:
+  - BTC spot price (USD)
+  - ETH spot price (USD)
+  - Crypto Fear & Greed index (0–100)
+  - BTC dominance (%)
+
+These values are contextual features for the AI engine (Sprint 4).
+They are fetched once per snapshot run — not per market — and attached
+to every snapshot row in that run.
+
+Design decisions:
+- Uses free public APIs that require no API key. Failures are non-fatal:
+  if BTC price is unavailable, we store NULL and snapshot collection
+  continues normally. A missing context field is infinitely better than
+  a failed snapshot run.
+- Results are cached for CACHE_TTL_SECONDS within a single process run.
+  At 5-minute snapshot intervals, this prevents 200 API calls to price
+  APIs for 200 markets — we make exactly ONE call per context field per
+  snapshot run.
+- CoinGecko free API has a rate limit of ~30 req/min. Caching ensures
+  we stay well within that.
+
+APIs used:
+  CoinGecko   — BTC/ETH price, BTC dominance
+  Alternative.me — Fear & Greed index
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Optional
+
+import httpx
+
+from config.settings import settings
+from utils.logger import get_logger
+from utils.retry import retry
+
+log = get_logger(__name__)
+
+# Cache TTL in seconds — one snapshot run is ~30s, this covers the whole run
+CACHE_TTL_SECONDS = 120
+
+
+@dataclass
+class ExternalPriceContext:
+    """
+    External context data attached to every snapshot in a given run.
+    All fields are Optional — failures are non-fatal.
+    """
+    btc_price_usd: Optional[Decimal]
+    eth_price_usd: Optional[Decimal]
+    fear_greed_index: Optional[int]
+    btc_dominance: Optional[Decimal]
+    fetched_at: float = 0.0    # time.monotonic() timestamp of last fetch
+
+
+class ExternalPriceService:
+    """
+    Fetches and caches external price context for snapshot enrichment.
+
+    Usage (called once per snapshot run, not per market):
+        price_service = ExternalPriceService()
+        context = price_service.get_context()   # cached within TTL
+        # attach context fields to every snapshot in this run
+    """
+
+    COINGECKO_URL = "https://api.coingecko.com/api/v3"
+    FEAR_GREED_URL = "https://api.alternative.me/fng/"
+
+    def __init__(self) -> None:
+        timeout = httpx.Timeout(
+            timeout=settings.http_read_timeout,
+            connect=settings.http_connect_timeout,
+        )
+        self._client = httpx.Client(timeout=timeout, follow_redirects=True)
+        self._cache: Optional[ExternalPriceContext] = None
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "ExternalPriceService":
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
+
+    def get_context(self) -> ExternalPriceContext:
+        """
+        Returns the current external price context, using cache if fresh.
+        Failures on individual APIs return NULL for that field only —
+        snapshot collection is never blocked by a price API outage.
+        """
+        if self._is_cache_valid():
+            return self._cache  # type: ignore[return-value]
+
+        log.debug("external_price_fetch_start")
+
+        btc_price, eth_price, btc_dominance = self._fetch_crypto_prices()
+        fear_greed = self._fetch_fear_greed()
+
+        context = ExternalPriceContext(
+            btc_price_usd=btc_price,
+            eth_price_usd=eth_price,
+            fear_greed_index=fear_greed,
+            btc_dominance=btc_dominance,
+            fetched_at=time.monotonic(),
+        )
+        self._cache = context
+
+        log.info(
+            "external_price_fetched",
+            btc_price=str(btc_price) if btc_price else None,
+            eth_price=str(eth_price) if eth_price else None,
+            fear_greed=fear_greed,
+            btc_dominance=str(btc_dominance) if btc_dominance else None,
+        )
+
+        return context
+
+    # -------------------------------------------------------------------------
+    # Private fetch methods — each handles its own failures
+    # -------------------------------------------------------------------------
+
+    @retry(exceptions=(httpx.HTTPError, Exception))
+    def _fetch_crypto_prices(
+        self,
+    ) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+        """
+        Fetch BTC price, ETH price, and BTC dominance from CoinGecko.
+        Returns (btc_usd, eth_usd, btc_dominance) — all Optional.
+        """
+        try:
+            # Single request fetches both coins
+            response = self._client.get(
+                f"{self.COINGECKO_URL}/simple/price",
+                params={
+                    "ids": "bitcoin,ethereum",
+                    "vs_currencies": "usd",
+                    "include_market_cap": "false",
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            btc = self._safe_decimal(data.get("bitcoin", {}).get("usd"))
+            eth = self._safe_decimal(data.get("ethereum", {}).get("usd"))
+
+            # Fetch BTC dominance separately
+            dominance = self._fetch_btc_dominance()
+
+            return btc, eth, dominance
+
+        except Exception as exc:
+            log.warning("crypto_price_fetch_failed", error=str(exc))
+            return None, None, None
+
+    def _fetch_btc_dominance(self) -> Optional[Decimal]:
+        """Fetch BTC market dominance from CoinGecko global endpoint."""
+        try:
+            response = self._client.get(f"{self.COINGECKO_URL}/global")
+            response.raise_for_status()
+            data = response.json()
+            pct = data.get("data", {}).get("market_cap_percentage", {}).get("btc")
+            if pct is not None:
+                # Convert percentage (e.g. 52.34) to decimal (0.5234)
+                return Decimal(str(pct)) / Decimal("100")
+            return None
+        except Exception as exc:
+            log.warning("btc_dominance_fetch_failed", error=str(exc))
+            return None
+
+    @retry(exceptions=(httpx.HTTPError, Exception))
+    def _fetch_fear_greed(self) -> Optional[int]:
+        """
+        Fetch the current Crypto Fear & Greed index (0–100).
+        API: https://api.alternative.me/fng/
+        Returns integer 0–100, or None on failure.
+        """
+        try:
+            response = self._client.get(
+                self.FEAR_GREED_URL,
+                params={"limit": 1, "format": "json"},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            value_str = data.get("data", [{}])[0].get("value")
+            if value_str is not None:
+                value = int(value_str)
+                if 0 <= value <= 100:
+                    return value
+            return None
+
+        except Exception as exc:
+            log.warning("fear_greed_fetch_failed", error=str(exc))
+            return None
+
+    def _is_cache_valid(self) -> bool:
+        if self._cache is None:
+            return False
+        age = time.monotonic() - self._cache.fetched_at
+        return age < CACHE_TTL_SECONDS
+
+    @staticmethod
+    def _safe_decimal(value) -> Optional[Decimal]:
+        if value is None:
+            return None
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return None
+
+=== FILE: ./python/services/polymarket_service.py ===
+"""
+services/polymarket_service.py
+
+Changelog:
+  v1.4 — fix CLOB closed market handling.
+          get_orderbook() sekarang cek field `closed` dari CLOB /markets response.
+          Kalau closed=True → return ClosedMarketSignal bukan None.
+          SnapshotsCollector pakai sinyal ini untuk mark market as resolved di DB,
+          bukan hanya skip snapshot — sehingga market tidak di-retry tiap 5 menit.
+
+          Juga fix token_id parsing: field yang benar adalah `token_id`
+          (bukan `token`, `id`, atau key lain).
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+from typing import Any, Iterator
+
+import httpx
+
+from config.settings import settings
+from utils.logger import get_logger
+from utils.retry import retry
+
+log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class PolymarketAPIError(Exception):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        url: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.url = url
+
+
+class PolymarketRateLimitError(PolymarketAPIError):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Data shapes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RawMarket:
+    """
+    Normalised market metadata dari Gamma API.
+
+    Field notes (post-audit v1.3):
+      num_traders:
+        Gamma API TIDAK mengembalikan jumlah trader per market.
+        num_traders = 0 secara default.
+
+      volume_24h_usd:
+        Dari field `volume24hr` di Gamma response.
+
+      best_bid, best_ask, spread:
+        Tersedia langsung di Gamma response.
+
+      price_change_1h, price_change_1d:
+        Delta probabilitas dalam 1 jam dan 1 hari.
+    """
+    condition_id: str
+    question: str
+    slug: str | None
+    description: str | None
+    category: str
+    sub_category: str | None
+    tags: list[str]
+    resolution_source: str | None
+    start_date: str | None
+    end_date: str | None
+    resolved_at: str | None
+    status: str
+    market_probability: Decimal | None
+    volume_usd: Decimal
+    volume_24h_usd: Decimal
+    liquidity_usd: Decimal
+    num_traders: int
+    best_bid: Decimal | None
+    best_ask: Decimal | None
+    spread: Decimal | None
+    price_change_1h: Decimal | None
+    price_change_1d: Decimal | None
+    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+
+@dataclass
+class RawOrderbook:
+    """Live price snapshot dari CLOB API."""
+    condition_id: str
+    probability_yes: Decimal
+    probability_no: Decimal
+    best_bid: Decimal | None
+    best_ask: Decimal | None
+    spread: Decimal | None
+
+
+@dataclass
+class ClosedMarketSignal:
+    """
+    Sentinel dikembalikan oleh get_orderbook() ketika CLOB melaporkan
+    market sudah closed (closed=True atau 404 pada /book).
+
+    SnapshotsCollector memakai ini untuk mark market as resolved di DB
+    sehingga market tidak di-snapshot ulang setiap 5 menit.
+
+    Berbeda dari None (= API error / network failure, perlu retry).
+    """
+    condition_id: str
+    reason: str  # "clob_closed" | "no_orderbook"
+
+
+# ---------------------------------------------------------------------------
+# PolymarketService
+# ---------------------------------------------------------------------------
+
+class PolymarketService:
+    """HTTP client untuk Polymarket Gamma dan CLOB APIs."""
+
+    CRYPTO_TAGS = frozenset({
+        "crypto", "bitcoin", "ethereum", "defi", "altcoins",
+        "btc", "eth", "solana", "bnb", "xrp", "cryptocurrency",
+        "base", "arbitrum", "polygon", "avalanche", "cardano",
+        "ripple", "dogecoin", "doge", "shib", "pepe",
+    })
+
+    # IMPORTANT: keywords pakai spasi atau prefix $ untuk avoid substring match.
+    # Contoh bug: "eth" match "Gaethje", "defi" match "trade deficit", "token" match apapun.
+    # Semua entry di sini harus spesifik dan tidak ambigu.
+    CRYPTO_QUESTION_KEYWORDS = frozenset({
+        "bitcoin", "ethereum",
+        " btc ", "$btc", "btc ", "btc$",
+        " eth ", "$eth", "eth ", "eth$",
+        " sol ", "$sol", "solana",
+        " bnb ", "$bnb",
+        " xrp ", "$xrp",
+        " doge ", "$doge", "dogecoin",
+        " usdc", " usdt",
+        "cryptocurrency", " crypto ",
+    })
+
+    def __init__(self) -> None:
+        timeout = httpx.Timeout(
+            timeout=settings.http_read_timeout,
+            connect=settings.http_connect_timeout,
+        )
+        self._client = httpx.Client(
+            timeout=timeout,
+            headers=self._build_headers(),
+            follow_redirects=True,
+        )
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "PolymarketService":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    # =========================================================================
+    # Gamma API — market metadata
+    # =========================================================================
+
+    def iter_active_crypto_markets(self, full_scan: bool = False) -> Iterator[list[RawMarket]]:
+        """
+        Iterate active crypto markets from Gamma API.
+
+        Gamma keyset pagination is broken — cursor repeats after page 1,
+        returning identical data. Offset pagination works correctly.
+
+        full_scan=False (default, incremental):
+            Fetch only first 500 markets by volume (offsets 0-499).
+            Used for hourly sync — captures all high-volume markets.
+            Runtime: ~2s.
+
+        full_scan=True (daily):
+            Fetch all ~10,000+ active markets across all offsets.
+            Used for daily sync — discovers new/low-volume crypto markets.
+            Runtime: ~35s.
+        """
+        log.info("gamma_pagination_start", mode="offset", full_scan=full_scan)
+        yield from self._iter_offset_pagination(full_scan=full_scan)
+
+    # Stop fetching pages when all markets on a page are below this volume.
+    # Markets with < $500 volume have no meaningful liquidity for paper trading.
+    MIN_PAGE_VOLUME_USD = 500.0
+
+    def _iter_keyset_pagination(self) -> Iterator[list[RawMarket]]:
+        cursor: str | None = None
+        page_num = 0
+        total_crypto = 0
+        seen_cursors: set[str] = set()
+
+        while True:
+            page_num += 1
+            params: dict[str, Any] = {
+                "active": "true",
+                "limit": settings.gamma_page_size,
+                "order": "volume",
+                "ascending": "false",
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            log.debug("keyset_page_request", page=page_num, cursor=cursor[:20] if cursor else None)
+
+            response_data, next_cursor = self._fetch_keyset_page(params)
+
+            if not response_data:
+                log.info("keyset_pagination_complete", total_pages=page_num - 1, total_crypto=total_crypto, reason="empty_page")
+                return
+
+            # Stop when all markets on page are below volume threshold.
+            # Markets are ordered by volume desc — once a full page is low-volume,
+            # all subsequent pages will be too.
+            page_max_volume = max(
+                float(m.get("volumeNum") or m.get("volume") or 0)
+                for m in response_data
+            )
+            if page_max_volume < self.MIN_PAGE_VOLUME_USD:
+                log.info(
+                    "keyset_pagination_complete",
+                    total_pages=page_num,
+                    total_crypto=total_crypto,
+                    reason="below_volume_threshold",
+                    page_max_volume=page_max_volume,
+                )
+                return
+
+            crypto_raw = [m for m in response_data if self._is_crypto(m)]
+            if crypto_raw:
+                parsed = self._parse_page(crypto_raw)
+                if parsed:
+                    total_crypto += len(parsed)
+                    log.debug(
+                        "keyset_page_parsed",
+                        page=page_num,
+                        total_on_page=len(response_data),
+                        crypto_on_page=len(parsed),
+                        total_crypto_so_far=total_crypto,
+                    )
+                    yield parsed
+
+            if not next_cursor:
+                log.info("keyset_pagination_complete", total_pages=page_num, total_crypto=total_crypto, reason="no_next_cursor")
+                return
+
+            # Safety: detect cursor loop (API bug / wrap-around)
+            if next_cursor in seen_cursors:
+                log.warning(
+                    "keyset_cursor_loop_detected",
+                    total_pages=page_num,
+                    total_crypto=total_crypto,
+                    cursor=next_cursor[:20],
+                )
+                return
+            seen_cursors.add(next_cursor)
+
+            cursor = next_cursor
+
+    @retry(exceptions=(httpx.HTTPError, PolymarketRateLimitError))
+    def _fetch_keyset_page(self, params: dict[str, Any]) -> tuple[list[dict], str | None]:
+        url = f"{settings.polymarket_gamma_url}/markets/keyset"
+        try:
+            response = self._client.get(url, params=params)
+            if response.status_code == 404:
+                raise PolymarketAPIError("Keyset endpoint not found", status_code=404, url=url)
+            self._raise_for_status(response, url)
+            data = response.json()
+
+            if isinstance(data, list):
+                markets_list = data
+                next_cursor = None
+                for header_key, header_val in response.headers.items():
+                    if header_key.lower() == "x-next-cursor":
+                        next_cursor = header_val
+                        break
+                if not next_cursor and markets_list:
+                    next_cursor = markets_list[-1].get("cursor") or None
+            elif isinstance(data, dict):
+                markets_list = data.get("data") or data.get("markets") or data.get("results") or []
+                next_cursor = data.get("next_cursor") or data.get("nextCursor") or data.get("cursor")
+            else:
+                markets_list = []
+                next_cursor = None
+
+            return markets_list, next_cursor
+
+        except httpx.TimeoutException as exc:
+            raise PolymarketAPIError("Keyset API timeout", url=url) from exc
+        except httpx.NetworkError as exc:
+            raise PolymarketAPIError(f"Keyset API network error: {exc}", url=url) from exc
+
+    # Incremental sync: only fetch top N markets by volume.
+    # Covers all markets with meaningful liquidity without full scan overhead.
+    INCREMENTAL_OFFSET_LIMIT = 500
+
+    def _iter_offset_pagination(self, full_scan: bool = False) -> Iterator[list[RawMarket]]:
+        offset = 0
+        page_num = 0
+        total_crypto = 0
+        offset_limit = None if full_scan else self.INCREMENTAL_OFFSET_LIMIT
+
+        while True:
+            # Incremental mode: stop after INCREMENTAL_OFFSET_LIMIT markets
+            if offset_limit is not None and offset >= offset_limit:
+                log.info(
+                    "offset_pagination_complete",
+                    total_pages=page_num,
+                    total_crypto=total_crypto,
+                    reason="incremental_limit_reached",
+                    offset=offset,
+                )
+                return
+
+            page_num += 1
+            params = {
+                "active": "true",
+                "limit": 100,  # Gamma API max limit is 100
+                "offset": offset,
+                "order": "volume",
+                "ascending": "false",
+            }
+            log.debug("offset_page_request", page=page_num, offset=offset)
+
+            try:
+                raw_response = self._fetch_offset_page(params)
+            except PolymarketAPIError as exc:
+                if exc.status_code == 422:
+                    log.info("offset_pagination_complete", total_pages=page_num - 1, total_crypto=total_crypto, reason="offset_limit")
+                    return
+                raise
+
+            if isinstance(raw_response, list):
+                markets_data = raw_response
+            elif isinstance(raw_response, dict):
+                markets_data = raw_response.get("markets") or raw_response.get("data") or raw_response.get("results") or []
+            else:
+                return
+
+            if not markets_data:
+                log.info("offset_pagination_complete", total_pages=page_num - 1)
+                return
+
+            crypto_raw = [m for m in markets_data if self._is_crypto(m)]
+            if crypto_raw:
+                parsed = self._parse_page(crypto_raw)
+                if parsed:
+                    total_crypto += len(parsed)
+                    yield parsed
+
+            if len(markets_data) < 100:  # Gamma API max limit is 100
+                log.info("offset_pagination_complete", total_pages=page_num, total_crypto=total_crypto)
+                return
+
+            offset += 100  # Gamma API max limit is 100
+
+    @retry(exceptions=(httpx.HTTPError, PolymarketRateLimitError))
+    def _fetch_offset_page(self, params: dict[str, Any]) -> Any:
+        url = f"{settings.polymarket_gamma_url}/markets"
+        try:
+            response = self._client.get(url, params=params)
+            self._raise_for_status(response, url)
+            return response.json()
+        except httpx.TimeoutException as exc:
+            raise PolymarketAPIError("Gamma API timeout", url=url) from exc
+        except httpx.NetworkError as exc:
+            raise PolymarketAPIError(f"Gamma API network error: {exc}", url=url) from exc
+
+    # =========================================================================
+    # CLOB API — live price data
+    # =========================================================================
+
+    @retry(
+            exceptions=(httpx.HTTPError, PolymarketRateLimitError, PolymarketAPIError),
+            exclude_on=lambda exc: getattr(exc, 'status_code', None) == 404
+    )
+    def get_orderbook(self, condition_id: str) -> RawOrderbook | ClosedMarketSignal | None:
+        """
+        Fetch live orderbook untuk satu market.
+
+        Return values:
+          RawOrderbook         — sukses, ada data live
+          ClosedMarketSignal   — market sudah closed di CLOB (bukan error)
+          None                 — API/network error, perlu retry nanti
+
+        FIX v1.4:
+          1. Cek field `closed` dari /markets response sebelum fetch /book.
+             Kalau closed=True → langsung return ClosedMarketSignal.
+          2. Kalau /book return 404 → juga return ClosedMarketSignal
+             (orderbook sudah tidak ada, bukan network error).
+          3. token_id diambil dari field `token_id` (verified dari audit).
+             Field `token`, `id` dihapus dari fallback chain.
+        """
+        url_market = f"{settings.polymarket_clob_url}/markets/{condition_id}"
+        try:
+            response = self._client.get(url_market)
+
+            if response.status_code == 404:
+                # Market tidak dikenal CLOB sama sekali
+                log.warning("clob_market_not_found", condition_id=condition_id)
+                return ClosedMarketSignal(condition_id=condition_id, reason="clob_not_found")
+
+            self._raise_for_status(response, url_market)
+            market_data = response.json()
+
+            if not market_data:
+                return None
+
+            # FIX: Cek closed status dari CLOB sebelum fetch orderbook.
+            # CLOB bisa closed=True sementara Gamma masih active=True (lag).
+            if market_data.get("closed", False):
+                log.info(
+                    "clob_market_closed",
+                    condition_id=condition_id,
+                    active=market_data.get("active"),
+                )
+                return ClosedMarketSignal(condition_id=condition_id, reason="clob_closed")
+
+            # FIX: field yang benar adalah `token_id` (verified dari audit)
+            tokens = market_data.get("tokens", [])
+            token_id: str | None = None
+            if tokens and isinstance(tokens, list):
+                first_token = tokens[0]
+                if isinstance(first_token, dict):
+                    token_id = first_token.get("token_id")
+
+            if not token_id:
+                log.warning("clob_no_token_id", condition_id=condition_id)
+                return None
+
+            # Fetch orderbook
+            url_book = f"{settings.polymarket_clob_url}/book"
+            response_book = self._client.get(url_book, params={"token_id": token_id})
+
+            # FIX: 404 pada /book = orderbook sudah tutup, bukan network error.
+            # Return ClosedMarketSignal bukan raise exception (tidak di-retry).
+            if response_book.status_code == 404:
+                log.info(
+                    "clob_orderbook_closed",
+                    condition_id=condition_id,
+                    token_id=token_id[:20],
+                )
+                return ClosedMarketSignal(condition_id=condition_id, reason="no_orderbook")
+
+            self._raise_for_status(response_book, url_book)
+            orderbook_data = response_book.json() if response_book.status_code == 200 else None
+
+            return self._parse_clob_market(condition_id, market_data, orderbook_data)
+
+        except httpx.TimeoutException as exc:
+            raise PolymarketAPIError("CLOB API timeout", url=url_market) from exc
+        except httpx.NetworkError as exc:
+            raise PolymarketAPIError("CLOB API network error", url=url_market) from exc
+
+    def get_orderbooks_batch(
+        self, condition_ids: list[str]
+    ) -> dict[str, RawOrderbook | ClosedMarketSignal | None]:
+        results: dict[str, RawOrderbook | ClosedMarketSignal | None] = {}
+        for condition_id in condition_ids:
+            try:
+                results[condition_id] = self.get_orderbook(condition_id)
+            except PolymarketAPIError as exc:
+                log.error("orderbook_fetch_failed", condition_id=condition_id, error=str(exc))
+                results[condition_id] = None
+        return results
+
+    # =========================================================================
+    # Parsers
+    # =========================================================================
+
+    def _parse_page(self, raw_markets: list[dict]) -> list[RawMarket]:
+        parsed = []
+        for m in raw_markets:
+            try:
+                parsed.append(self._parse_gamma_market(m))
+            except Exception as exc:
+                log.warning("market_parse_error", condition_id=m.get("conditionId", "unknown"), error=str(exc))
+        return parsed
+
+    def _parse_gamma_market(self, data: dict[str, Any]) -> RawMarket:
+        """
+        Normalise Gamma API market response ke RawMarket.
+
+        Field mappings (verified dari audit 2026-06-05):
+          conditionId         → condition_id
+          outcomePrices[0]    → market_probability
+          volume / volumeNum  → volume_usd
+          volume24hr          → volume_24h_usd
+          liquidity           → liquidity_usd
+          bestBid             → best_bid
+          bestAsk             → best_ask
+          spread              → spread
+          oneHourPriceChange  → price_change_1h
+          oneDayPriceChange   → price_change_1d
+
+        num_traders = 0: tradesCount/uniqueTraders tidak ada di Gamma response.
+        """
+        status = self._derive_status(data)
+        probability_yes = self._extract_probability_yes(data)
+        tags = self._extract_tags(data)
+        category, sub_category = self._classify_market(data, tags)
+
+        return RawMarket(
+            condition_id=str(data.get("conditionId") or data.get("condition_id") or ""),
+            question=str(data.get("question") or "")[:500],
+            slug=data.get("slug"),
+            description=data.get("description"),
+            category=category,
+            sub_category=sub_category,
+            tags=tags,
+            resolution_source=(data.get("resolutionSource") or data.get("resolution_source")),
+            start_date=data.get("startDate") or data.get("start_date"),
+            end_date=data.get("endDate") or data.get("end_date"),
+            resolved_at=data.get("resolvedAt") or data.get("resolved_at"),
+            status=status,
+            market_probability=probability_yes,
+            volume_usd=self._safe_decimal(data.get("volumeNum") or data.get("volume") or 0),
+            volume_24h_usd=self._safe_decimal(data.get("volume24hr") or 0),
+            liquidity_usd=self._safe_decimal(data.get("liquidityNum") or data.get("liquidity") or 0),
+            num_traders=0,  # Gamma API tidak expose traders count
+            best_bid=self._safe_decimal_or_none(data.get("bestBid")),
+            best_ask=self._safe_decimal_or_none(data.get("bestAsk")),
+            spread=self._safe_decimal_or_none(data.get("spread")),
+            price_change_1h=self._safe_decimal_or_none(data.get("oneHourPriceChange")),
+            price_change_1d=self._safe_decimal_or_none(data.get("oneDayPriceChange")),
+            raw=data,
+        )
+
+    def _parse_clob_market(
+        self,
+        condition_id: str,
+        market_data: dict[str, Any],
+        orderbook_data: dict[str, Any] | None = None,
+    ) -> RawOrderbook:
+        # Probability dari tokens[0].price
+        probability_yes: Decimal | None = None
+        tokens = market_data.get("tokens", [])
+
+        if tokens and isinstance(tokens, list):
+            first_token = tokens[0]
+            if isinstance(first_token, dict):
+                token_price = first_token.get("price")
+                if token_price is not None:
+                    probability_yes = self._safe_decimal_or_none(token_price)
+
+        if probability_yes is None:
+            probability_yes = self._extract_probability_yes(market_data)
+        if probability_yes is None:
+            probability_yes = Decimal("0.5")
+
+        probability_yes = max(Decimal("0"), min(Decimal("1"), probability_yes))
+        probability_no = Decimal("1") - probability_yes
+
+        best_bid: Decimal | None = None
+        best_ask: Decimal | None = None
+
+        if orderbook_data and isinstance(orderbook_data, dict):
+            bids = orderbook_data.get("bids", [])
+            asks = orderbook_data.get("asks", [])
+
+            if bids and isinstance(bids, list):
+                first_bid = bids[0]
+                if isinstance(first_bid, (list, tuple)):
+                    best_bid = self._safe_decimal_or_none(first_bid[0])
+                elif isinstance(first_bid, dict):
+                    best_bid = self._safe_decimal_or_none(first_bid.get("price"))
+
+            if asks and isinstance(asks, list):
+                first_ask = asks[0]
+                if isinstance(first_ask, (list, tuple)):
+                    best_ask = self._safe_decimal_or_none(first_ask[0])
+                elif isinstance(first_ask, dict):
+                    best_ask = self._safe_decimal_or_none(first_ask.get("price"))
+
+        spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
+
+        return RawOrderbook(
+            condition_id=condition_id,
+            probability_yes=probability_yes,
+            probability_no=probability_no,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            spread=spread,
+        )
+
+    # =========================================================================
+    # Private helpers
+    # =========================================================================
+
+    def _build_headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": f"PolymarketIntelligence/{settings.collector_version}",
+        }
+        if settings.polymarket_api_key:
+            headers["Authorization"] = f"Bearer {settings.polymarket_api_key}"
+        return headers
+
+    def _raise_for_status(self, response: httpx.Response, url: str) -> None:
+        if response.status_code == 429:
+            raise PolymarketRateLimitError("Rate limited", status_code=429, url=url)
+        if response.status_code >= 500:
+            raise PolymarketAPIError(f"Server error {response.status_code}", status_code=response.status_code, url=url)
+        if response.status_code >= 400:
+            raise PolymarketAPIError(
+                f"Client error {response.status_code}: {response.text[:300]}",
+                status_code=response.status_code,
+                url=url,
+            )
+
+    def _derive_status(self, data: dict[str, Any]) -> str:
+        if data.get("archived", False):
+            return "cancelled"
+        if data.get("closed", False):
+            resolved_at = data.get("resolvedAt") or data.get("resolved_at")
+            return "resolved" if resolved_at else "paused"
+        if data.get("active", True):
+            return "active"
+        return "paused"
+
+    # Micro market patterns — always excluded regardless of crypto keywords.
+    # These are 5-minute direction markets with no exploitable edge.
+    MICRO_MARKET_PATTERNS = (
+        "up or down",
+    )
+
+    def _is_crypto(self, data: dict[str, Any]) -> bool:
+        question = (data.get("question") or "").lower()
+
+        # Exclude micro/noise markets first
+        if any(p in question for p in self.MICRO_MARKET_PATTERNS):
+            return False
+
+        category = (data.get("category") or "").lower()
+        if "crypto" in category:
+            return True
+        tags = self._extract_tags(data)
+        if {t.lower() for t in tags} & self.CRYPTO_TAGS:
+            return True
+        return any(kw in question for kw in self.CRYPTO_QUESTION_KEYWORDS)
+
+    def _classify_market(self, data: dict[str, Any], tags: list[str]) -> tuple[str, str | None]:
+        tags_lower = {t.lower() for t in tags}
+        question = (data.get("question") or "").lower()
+        sub_category: str | None = None
+
+        if tags_lower & {"bitcoin", "btc"} or "bitcoin" in question or " btc " in question:
+            sub_category = "bitcoin"
+        elif tags_lower & {"ethereum", "eth"} or "ethereum" in question or " eth " in question:
+            sub_category = "ethereum"
+        elif tags_lower & {"solana", "sol"} or "solana" in question or " sol " in question:
+            sub_category = "solana"
+        elif tags_lower & {"bnb", "binance"} or " bnb " in question:
+            sub_category = "bnb"
+        elif tags_lower & {"xrp", "ripple"} or " xrp " in question:
+            sub_category = "xrp"
+        elif "defi" in tags_lower or "defi" in question:
+            sub_category = "defi"
+
+        return "crypto", sub_category
+
+    def _extract_tags(self, data: dict[str, Any]) -> list[str]:
+        raw_tags = data.get("tags", [])
+        if isinstance(raw_tags, str):
+            try:
+                raw_tags = json.loads(raw_tags)
+            except (ValueError, json.JSONDecodeError):
+                return []
+        if isinstance(raw_tags, list):
+            result = []
+            for t in raw_tags:
+                if isinstance(t, str):
+                    result.append(t)
+                elif isinstance(t, dict):
+                    label = t.get("label") or t.get("slug") or t.get("id") or t.get("name") or ""
+                    if label:
+                        result.append(str(label))
+            return result
+        return []
+
+    def _extract_probability_yes(self, data: dict[str, Any]) -> Decimal | None:
+        outcome_prices = data.get("outcomePrices")
+        if outcome_prices is None:
+            return None
+        if isinstance(outcome_prices, str):
+            try:
+                outcome_prices = json.loads(outcome_prices)
+            except (ValueError, json.JSONDecodeError):
+                return None
+        if isinstance(outcome_prices, list) and outcome_prices:
+            try:
+                p = Decimal(str(outcome_prices[0]))
+                return max(Decimal("0"), min(Decimal("1"), p))
+            except (InvalidOperation, Exception):
+                return None
+        return None
+
+    @staticmethod
+    def _safe_decimal(value: Any) -> Decimal:
+        try:
+            if value is None:
+                return Decimal("0")
+            return Decimal(str(value))
+        except (InvalidOperation, Exception):
+            return Decimal("0")
+
+    @staticmethod
+    def _safe_decimal_or_none(value: Any) -> Decimal | None:
+        if value is None:
+            return None
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, Exception):
+            return None
+=== FILE: ./python/services/signal_evaluator.py ===
+"""
+services/signal_evaluator.py
+
+Sprint 3 — Signal Performance Tracking
+
+Evaluates pending signals against resolved market outcomes.
+
+Responsibilities:
+  1. Find signals with status = 'pending' that have a resolved market_outcome
+  2. Calculate is_correct and realized_roi per signal
+  3. Update signal row: status='resolved', resolved_outcome, is_correct,
+     realized_roi, resolved_at
+  4. Return evaluation metrics for logging
+
+Design decisions:
+  - Pure evaluation logic — no HTTP calls, no external APIs.
+  - One DB transaction per batch of signals for a single market.
+    If one market's batch fails, others are not affected.
+  - ROI formula is economically correct for binary prediction markets:
+      YES win:  profit = (1.0 - entry) per unit. ROI = profit/entry * 100
+      NO  win:  profit = entry per unit on NO side.
+                NO entry price = (1.0 - market_prob).
+                ROI = (1 - no_entry) / no_entry * 100
+                    = entry / (1 - entry) * 100
+      Loss:     -100% (total loss of position)
+      Cancelled: 0% (refund, no gain no loss)
+  - Signals for cancelled markets are marked resolved with ROI = 0,
+    is_correct = None (neither right nor wrong).
+
+ROI examples:
+  Signal YES at market_prob = 0.35 → entry = 0.35
+    WIN:  ((1.0 - 0.35) / 0.35) * 100 = +185.7%
+    LOSS: -100%
+
+  Signal NO at market_prob = 0.35 → NO entry = 1 - 0.35 = 0.65
+    WIN:  (0.35 / (1.0 - 0.35)) * 100 = +53.8%
+    LOSS: -100%
+
+Run cadence: called by scheduler after snapshot collection,
+  or run manually via analyze_rules.py.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from models.market import Market, MarketOutcome
+from models.signal import Signal
+from utils.db import get_session
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Result dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EvaluationResult:
+    """Metrics from a single evaluator run."""
+    evaluated:  int = 0
+    skipped:    int = 0   # pending but no outcome yet
+    errors:     int = 0
+    correct:    int = 0
+    incorrect:  int = 0
+    cancelled:  int = 0
+    duration_seconds: float = 0.0
+
+    @property
+    def win_rate(self) -> float:
+        decided = self.correct + self.incorrect
+        return (self.correct / decided) if decided > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+
+class SignalEvaluator:
+    """
+    Evaluates pending signals after market resolution.
+
+    Usage:
+        evaluator = SignalEvaluator()
+        result = evaluator.run()
+
+    Called by scheduler or analyze_rules.py.
+    """
+
+    # Batch size per DB transaction — prevents lock contention on large runs
+    BATCH_SIZE = 100
+
+    def run(self) -> EvaluationResult:
+        log.info("signal_evaluator_run_start")
+        started_at = time.monotonic()
+        result = EvaluationResult()
+
+        try:
+            pending_signals = self._load_pending_signals_with_outcomes()
+
+            if not pending_signals:
+                log.info("signal_evaluator_nothing_to_evaluate")
+                return result
+
+            log.info("signal_evaluator_loaded", count=len(pending_signals))
+
+            # Process in batches
+            for i in range(0, len(pending_signals), self.BATCH_SIZE):
+                batch = pending_signals[i : i + self.BATCH_SIZE]
+                batch_result = self._evaluate_batch(batch)
+
+                result.evaluated  += batch_result.evaluated
+                result.skipped    += batch_result.skipped
+                result.errors     += batch_result.errors
+                result.correct    += batch_result.correct
+                result.incorrect  += batch_result.incorrect
+                result.cancelled  += batch_result.cancelled
+
+        except Exception as exc:
+            log.exception("signal_evaluator_unexpected_error", error=str(exc))
+            raise
+        finally:
+            result.duration_seconds = time.monotonic() - started_at
+
+        log.info(
+            "signal_evaluator_run_done",
+            evaluated=result.evaluated,
+            correct=result.correct,
+            incorrect=result.incorrect,
+            cancelled=result.cancelled,
+            skipped=result.skipped,
+            errors=result.errors,
+            win_rate=round(result.win_rate, 4),
+            duration_sec=round(result.duration_seconds, 2),
+        )
+
+        return result
+
+    # -------------------------------------------------------------------------
+    # Private
+    # -------------------------------------------------------------------------
+
+    def _load_pending_signals_with_outcomes(self) -> list[tuple[Signal, MarketOutcome]]:
+        """
+        Load all pending signals that have a resolved market_outcome.
+
+        JOIN logic:
+          signals (status=pending)
+          → markets (via market_id)
+          → market_outcomes (via markets.id)
+
+        Only returns signals where market_outcomes EXISTS — pending signals
+        for markets that haven't resolved yet are naturally excluded.
+        """
+        with get_session() as session:
+            rows = session.execute(
+                select(Signal, MarketOutcome)
+                .join(Market, Signal.market_id == Market.id)
+                .join(MarketOutcome, MarketOutcome.market_id == Market.id)
+                .where(
+                    Signal.status == "pending",
+                    Signal.deleted_at.is_(None),
+                )
+                .order_by(Signal.fired_at.asc())
+            ).all()
+
+            # Detach cleanly: convert to plain tuples of primitive values
+            # to avoid DetachedInstanceError outside session
+            return [
+                _SignalOutcomePair(
+                    signal_id=row.Signal.id,
+                    market_id=row.Signal.market_id,
+                    direction=row.Signal.direction,
+                    entry_price=row.Signal.market_probability_at_signal,
+                    trigger_source=row.Signal.trigger_source,
+                    winning_side=row.MarketOutcome.winning_side,
+                    resolved_at=row.MarketOutcome.resolved_at,
+                )
+                for row in rows
+            ]
+
+    def _evaluate_batch(self, batch: list["_SignalOutcomePair"]) -> EvaluationResult:
+        result = EvaluationResult()
+
+        try:
+            with get_session() as session:
+                for pair in batch:
+                    try:
+                        self._evaluate_one(session, pair, result)
+                    except Exception as exc:
+                        result.errors += 1
+                        log.error(
+                            "signal_evaluation_error",
+                            signal_id=pair.signal_id,
+                            error=str(exc),
+                        )
+        except Exception as exc:
+            log.error(
+                "signal_evaluator_batch_failed",
+                batch_size=len(batch),
+                error=str(exc),
+            )
+            result.errors += len(batch)
+
+        return result
+
+    def _evaluate_one(
+        self,
+        session: Session,
+        pair: "_SignalOutcomePair",
+        result: EvaluationResult,
+    ) -> None:
+        """Evaluate a single signal and update its row in DB."""
+
+        winning_side = pair.winning_side
+        direction    = pair.direction
+        entry_price  = pair.entry_price
+        now          = datetime.now(timezone.utc)
+
+        # --- Cancelled market: ROI = 0, is_correct = None ---
+        if winning_side == "cancelled":
+            self._update_signal(
+                session,
+                signal_id=pair.signal_id,
+                resolved_outcome="cancelled",
+                is_correct=None,
+                realized_roi=Decimal("0.0000"),
+                resolved_at=pair.resolved_at,
+            )
+            result.evaluated += 1
+            result.cancelled += 1
+            log.debug(
+                "signal_evaluated_cancelled",
+                signal_id=pair.signal_id,
+                trigger_source=pair.trigger_source,
+            )
+            return
+
+        # --- Determine correctness ---
+        is_correct = (direction == winning_side)
+
+        # --- Calculate ROI ---
+        realized_roi = self._calculate_roi(direction, entry_price, winning_side)
+
+        # --- Update signal ---
+        self._update_signal(
+            session,
+            signal_id=pair.signal_id,
+            resolved_outcome=winning_side,
+            is_correct=is_correct,
+            realized_roi=realized_roi,
+            resolved_at=pair.resolved_at,
+        )
+
+        result.evaluated += 1
+        if is_correct:
+            result.correct += 1
+        else:
+            result.incorrect += 1
+
+        log.debug(
+            "signal_evaluated",
+            signal_id=pair.signal_id,
+            trigger_source=pair.trigger_source,
+            direction=direction,
+            winning_side=winning_side,
+            is_correct=is_correct,
+            realized_roi=float(realized_roi),
+            entry_price=float(entry_price),
+        )
+
+    def _calculate_roi(
+        self,
+        direction: str,
+        entry_price: Decimal,
+        winning_side: str,
+    ) -> Decimal:
+        """
+        Calculate realized ROI for a signal.
+
+        Binary prediction market economics:
+          - YES token costs `entry_price` (= market probability)
+          - NO  token costs `1 - entry_price`
+          - Winner pays out 1.0 per token
+
+        YES direction win:
+          profit per unit = 1.0 - entry_price
+          ROI = (1.0 - entry_price) / entry_price * 100
+
+        NO direction win:
+          no_entry_price = 1.0 - entry_price
+          profit per unit = 1.0 - no_entry_price = entry_price
+          ROI = entry_price / (1.0 - entry_price) * 100
+
+        Any loss: ROI = -100 (full loss of position)
+
+        Edge cases:
+          entry_price = 0 → guard against division by zero → ROI = 0
+          entry_price = 1 → guard against division by zero → ROI = 0
+        """
+        LOSS_ROI = Decimal("-100.0000")
+        ZERO     = Decimal("0")
+        ONE      = Decimal("1")
+
+        # Guard: degenerate probabilities
+        if entry_price <= ZERO or entry_price >= ONE:
+            log.warning(
+                "roi_calc_degenerate_entry",
+                direction=direction,
+                entry_price=str(entry_price),
+            )
+            return ZERO
+
+        is_win = (direction == winning_side)
+
+        if not is_win:
+            return LOSS_ROI
+
+        if direction == "yes":
+            roi = ((ONE - entry_price) / entry_price) * Decimal("100")
+        else:  # direction == "no"
+            no_entry = ONE - entry_price
+            if no_entry <= ZERO:
+                return ZERO
+            roi = (entry_price / no_entry) * Decimal("100")
+
+        # Round to 4 decimal places for DB storage
+        return roi.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+    def _update_signal(
+        self,
+        session: Session,
+        signal_id: int,
+        resolved_outcome: str | None,
+        is_correct: bool | None,
+        realized_roi: Decimal,
+        resolved_at: datetime | None,
+    ) -> None:
+        """Update signal row with evaluation results."""
+        from sqlalchemy import update
+        session.execute(
+            update(Signal)
+            .where(Signal.id == signal_id)
+            .values(
+                status="resolved",
+                resolved_outcome=resolved_outcome,
+                is_correct=is_correct,
+                realized_roi=realized_roi,
+                resolved_at=resolved_at,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Internal DTO — avoids DetachedInstanceError
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _SignalOutcomePair:
+    """
+    Plain data container for one (Signal, MarketOutcome) join result.
+    Created inside session, used outside — no ORM dependency.
+    """
+    signal_id:      int
+    market_id:      int
+    direction:      str
+    entry_price:    Decimal
+    trigger_source: str
+    winning_side:   str
+    resolved_at:    datetime | None
+
+=== FILE: ./python/utils/__init__.py ===
+
+=== FILE: ./python/utils/db.py ===
+"""
+Database session factory.
+All collectors import get_session() from here — single source of truth.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from typing import Generator
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from config.settings import settings
+
+_engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,       # Verify connections are alive before using
+    pool_size=5,              # Collector is low-concurrency; 5 is plenty
+    max_overflow=10,
+    echo=settings.debug_sql,  # Log SQL in dev only
+)
+
+_SessionFactory = sessionmaker(bind=_engine, expire_on_commit=False)
+
+
+@contextmanager
+def get_session() -> Generator[Session, None, None]:
+    """
+    Context manager that provides a transactional database session.
+
+    Usage:
+        with get_session() as session:
+            session.add(snapshot)
+            # commits on exit, rolls back on exception
+
+    Design: Always use transactions. Never write raw SQL in collectors
+    when the ORM is sufficient.
+    """
+    session = _SessionFactory()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+=== FILE: ./python/utils/logger.py ===
+"""
+utils/logger.py
+
+Structured logging for the entire collector process.
+Every module uses get_logger(__name__) — never logging.getLogger().
+
+Design decisions:
+- structlog renders JSON in production (LOG_FORMAT=json) so log aggregators
+  (Datadog, Loki, CloudWatch) can parse fields natively.
+- In development (LOG_FORMAT=console) it renders colourised key=value pairs
+  that are easy to read in a terminal.
+- stdlib logging is redirected through structlog so SQLAlchemy echo,
+  APScheduler job logs, and httpx all appear in the same format.
+- configure_logging() is called exactly ONCE in scheduler.py at process boot,
+  before any other import that might trigger logging.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from typing import Any
+
+import structlog
+
+from config.settings import settings
+
+
+def configure_logging() -> None:
+    """
+    Wire structlog + stdlib logging for the whole process.
+    Must be called once at startup before any logger is used.
+    """
+    log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
+
+    # Processors applied to every event, regardless of final renderer
+    shared_processors: list[Any] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.PositionalArgumentsFormatter(),
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.ExceptionRenderer(),
+    ]
+
+    renderer: Any = (
+        structlog.processors.JSONRenderer()
+        if settings.log_format == "json"
+        else structlog.dev.ConsoleRenderer(colors=True)
+    )
+
+    structlog.configure(
+        processors=shared_processors
+        + [structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
+    formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared_processors,
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            renderer,
+        ],
+    )
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(log_level)
+
+    # Suppress noisy third-party loggers in normal operation
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.INFO)
+    logging.getLogger("sqlalchemy.engine").setLevel(
+        logging.DEBUG if settings.debug_sql else logging.WARNING
+    )
+
+
+def get_logger(name: str) -> structlog.stdlib.BoundLogger:
+    """
+    Return a bound structlog logger for the given module name.
+
+    Usage:
+        log = get_logger(__name__)
+        log.info("snapshot_stored", market_id=42, probability_yes=0.63)
+        log.warning("api_slow", elapsed_ms=4200, url="https://...")
+        log.error("db_write_failed", exc_info=True)
+    """
+    return structlog.get_logger(name)
+
+=== FILE: ./python/utils/retry.py ===
+"""
+Exponential backoff retry decorator for API calls.
+All collector HTTP requests MUST use this.
+
+Changelog:
+  v1.1 — tambah parameter exclude_on yang menerima callable predicate.
+          Dipakai oleh get_orderbook() agar PolymarketAPIError 404
+          tidak di-retry (permanent error, bukan transient).
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from functools import wraps
+from typing import Callable, Type
+
+from config.settings import settings
+
+logger = logging.getLogger(__name__)
+
+
+def retry(
+    max_attempts: int = settings.max_retries,
+    backoff_seconds: float = settings.retry_backoff_seconds,
+    exceptions: tuple[Type[Exception], ...] = (Exception,),
+    exclude_on: Callable[[Exception], bool] | None = None,
+) -> Callable:
+    """
+    Decorator: retry a function with exponential backoff.
+
+    Args:
+        max_attempts:    Jumlah maksimal percobaan.
+        backoff_seconds: Base untuk exponential backoff (wait = base ** attempt).
+        exceptions:      Exception types yang akan di-retry.
+        exclude_on:      Optional callable(exc) -> bool. Kalau return True,
+                         exception TIDAK di-retry dan langsung di-raise.
+                         Dipakai untuk skip retry pada permanent errors (404, dll).
+
+    Usage:
+        @retry(
+            exceptions=(PolymarketAPIError, httpx.HTTPError),
+            exclude_on=lambda exc: getattr(exc, 'status_code', None) == 404,
+        )
+        def get_orderbook(...): ...
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as exc:
+                    # Permanent error — jangan retry, langsung raise
+                    if exclude_on is not None and exclude_on(exc):
+                        logger.debug(
+                            "Retry excluded for %s (attempt %d): %s",
+                            func.__name__,
+                            attempt,
+                            exc,
+                        )
+                        raise
+
+                    last_exception = exc
+                    wait = backoff_seconds ** attempt
+                    logger.warning(
+                        "Attempt %d/%d failed for %s: %s. Retrying in %.1fs",
+                        attempt,
+                        max_attempts,
+                        func.__name__,
+                        exc,
+                        wait,
+                    )
+                    if attempt < max_attempts:
+                        time.sleep(wait)
+
+            logger.error("All %d attempts failed for %s", max_attempts, func.__name__)
+            raise last_exception
+        return wrapper
+    return decorator

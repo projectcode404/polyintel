@@ -155,7 +155,8 @@ final class SignalRankerService
     ): Collection {
         $openMarketCounts  = $this->getOpenTradeMarketCounts($account->id);
         $cooldownMarketIds = $this->getCooldownMarketIds((int) $settings->market_cooldown_minutes, $account->id);
-        return $signals->filter(function ($signal) use ($openMarketCounts, $cooldownMarketIds, $settings) {
+        $conflictMarketIds = $this->getConflictingMarketIds($signals->pluck('market_id')->filter()->unique()->values()->all(), $signals);
+        return $signals->filter(function ($signal) use ($openMarketCounts, $cooldownMarketIds, $conflictMarketIds, $settings) {
             $marketId = $signal['market_id'] ?? null;
 
             if (! $marketId) {
@@ -170,6 +171,15 @@ final class SignalRankerService
 
             // Check cooldown after stop loss
             if ($cooldownMarketIds->contains($marketId)) {
+                return false;
+            }
+
+            // Skip if opposite direction pending signal exists for same market
+            // Prevents opening a trade that SmartExit will immediately close
+            $direction = strtolower((string) ($signal['direction'] ?? 'yes'));
+            $opposite  = $direction === 'yes' ? 'no' : 'yes';
+            $hasOpposite = $conflictMarketIds->get($marketId, collect())->contains($opposite);
+            if ($hasOpposite) {
                 return false;
             }
 
@@ -292,5 +302,23 @@ final class SignalRankerService
     private function clamp(float $value, float $min = 0.0, float $max = 1.0): float
     {
         return max($min, min($max, $value));
+    }
+
+    /**
+     * Pre-fetch all market_ids that have a conflicting (opposite direction) pending signal.
+     * Returns Collection keyed by market_id => Collection of directions.
+     * Used to avoid N+1 queries inside applyMarketConstraints filter loop.
+     */
+    private function getConflictingMarketIds(array $marketIds, Collection $signals): Collection
+    {
+        if (empty($marketIds)) {
+            return collect();
+        }
+
+        // Build map of market_id => [directions] from the signals themselves
+        // A conflict exists when same market has both 'yes' and 'no' signals
+        return $signals->groupBy('market_id')->map(
+            fn ($group) => $group->pluck('direction')->map(fn ($d) => strtolower((string) $d))
+        );
     }
 }

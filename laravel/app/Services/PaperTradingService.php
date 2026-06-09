@@ -245,9 +245,10 @@ final class PaperTradingService
                 ? (float) $market->market_probability
                 : 1.0 - (float) $market->market_probability;
 
-            $unrealizedGross    = ($currentPrice - (float) $trade->entry_price) * (float) $trade->shares;
+            $sharesRemaining    = $trade->sharesRemaining();
+            $unrealizedGross    = ($currentPrice - (float) $trade->entry_price) * $sharesRemaining;
             $feeRate            = $this->portfolioService->getTradingFeePercentage();
-            $estimatedExitFee   = ((float) $trade->shares * $currentPrice) * $feeRate;
+            $estimatedExitFee   = ($sharesRemaining * $currentPrice) * $feeRate;
             $unrealizedNet      = $unrealizedGross - (float) $trade->fees_usd - $estimatedExitFee;
 
             $trade->current_price      = $currentPrice;

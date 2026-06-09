@@ -81,9 +81,14 @@ final class PortfolioManagerService
             'eligible_count' => $eligible->count(),
         ]);
 
-        // Step 3: Attempt to open each eligible signal in score order
+        // Step 3: Pre-fetch market end_dates to avoid N+1 in guard #6
+        $marketIds  = $eligible->pluck('market_id')->filter()->unique()->values()->all();
+        $marketEndDates = \App\Models\Market::whereIn('id', $marketIds)
+            ->pluck('end_date', 'id');
+
+        // Step 4: Attempt to open each eligible signal in score order
         foreach ($eligible as $signal) {
-            $outcome = $this->attemptOpen($signal, $settings, $state, $account);
+            $outcome = $this->attemptOpen($signal, $settings, $state, $account, $marketEndDates);
 
             if ($outcome['opened']) {
                 $results['opened']++;
@@ -116,7 +121,7 @@ final class PortfolioManagerService
      *
      * @return array{opened: bool, reason: string|null}
      */
-    private function attemptOpen(array $signal, PaperTradeSetting $settings, array $state, TradingAccount $account): array
+    private function attemptOpen(array $signal, PaperTradeSetting $settings, array $state, TradingAccount $account, \Illuminate\Support\Collection $marketEndDates = new \Illuminate\Support\Collection): array
     {
         // Guard 1: max concurrent trades
         if ($state['open_trades_count'] >= (int) $settings->max_concurrent_trades) {
@@ -168,6 +173,19 @@ final class PortfolioManagerService
             return $this->skip('Invalid entry price: ' . $entryPrice);
         }
 
+        // Guard 6: skip market expiring within 6 hours
+        // Prevents opening a trade that SmartExit will immediately close
+        $endDateRaw = $marketEndDates->get($signal['market_id'] ?? null);
+        if ($endDateRaw) {
+            $endDate = \Carbon\Carbon::parse($endDateRaw);
+            $hoursRemaining = now()->diffInHours($endDate, absolute: false);
+            if ($endDate->isPast() || $hoursRemaining < 6) {
+                return $this->skip(
+                    'Market expires within 6 hours — skipping to avoid immediate SmartExit'
+                );
+            }
+        }
+
         // Calculate exit levels and shares
         $exitLevels = $this->exitStrategyService->calculateExitLevels($settings, $entryPrice);
         $shares     = $this->sizerService->toShares($positionSize, $entryPrice);
@@ -175,6 +193,9 @@ final class PortfolioManagerService
         // Open trade in atomic transaction
         try {
             DB::transaction(function () use ($signal, $settings, $entryPrice, $positionSize, $shares, $exitLevels, $account) {
+                TradingAccount::where('id', $account->id)
+                    ->decrement('balance', $positionSize);
+
                 $trade = PaperTrade::create([
                     'trading_account_id'           => $account->id,
                     'market_id'                    => $signal['market_id'],
