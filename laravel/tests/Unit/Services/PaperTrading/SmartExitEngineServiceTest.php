@@ -167,25 +167,40 @@ class SmartExitEngineServiceTest extends TestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function it_triggers_partial_exit_on_momentum_reversal(): void
     {
-        // Market with far end_date ensures isNearExpiry does not trigger first
+        // Market dengan far end_date agar isNearExpiry tidak trigger duluan
         $market = Market::factory()->create(['end_date' => now()->addDays(60)]);
 
+        // Signal tanpa momentum (tidak relevan setelah patch)
         $signal = Signal::factory()->create([
-            'market_id'            => $market->id,
-            'momentum_24h_percent' => -15.0,
+            'market_id' => $market->id,
+            // momentum_24h_percent sengaja tidak diset — patch tidak membacanya
         ]);
 
         $trade = $this->makeTrade(
             entry: 0.5,
-            stopLoss: 0.40,
+            stopLoss: 0.20,   // jauh dari current price agar stop loss tidak trigger
             takeProfit: 0.80,
             marketId: $market->id,
             signalId: $signal->id
         );
 
-        $trade->load(['signal', 'market']);
+        // Snapshot sekarang: probability turun drastis
+        \App\Models\MarketSnapshot::factory()->create([
+            'market_id'       => $market->id,
+            'probability_yes' => 0.30,
+            'snapshotted_at'  => now(),
+        ]);
 
-        $decision = $this->engine->evaluate($trade, 0.52);
+        // Snapshot 24 jam lalu: probability tinggi
+        \App\Models\MarketSnapshot::factory()->create([
+            'market_id'       => $market->id,
+            'probability_yes' => 0.55,
+            'snapshotted_at'  => now()->subHours(24),
+        ]);
+
+        // Momentum = (0.30 - 0.55) / 0.55 * 100 = -45.5% → di bawah -10% → trigger
+        $trade->load(['signal', 'market']);
+        $decision = $this->engine->evaluate($trade, 0.30);
 
         $this->assertSame(SmartExitDecision::PARTIAL_EXIT_50, $decision->action);
         $this->assertStringContainsString('Momentum reversal', $decision->reason);
@@ -225,24 +240,65 @@ class SmartExitEngineServiceTest extends TestCase
     #[\PHPUnit\Framework\Attributes\Test]
     public function stop_loss_takes_priority_over_smart_exit(): void
     {
-        $signal = Signal::factory()->create([
-            'momentum_24h_percent' => -20.0, // would trigger smart exit
+        $market = Market::factory()->create(['end_date' => now()->addDays(60)]);
+
+        // Buat snapshot negatif yang akan trigger momentum rule
+        \App\Models\MarketSnapshot::factory()->create([
+            'market_id'       => $market->id,
+            'probability_yes' => 0.20,
+            'snapshotted_at'  => now(),
+        ]);
+        \App\Models\MarketSnapshot::factory()->create([
+            'market_id'       => $market->id,
+            'probability_yes' => 0.55,
+            'snapshotted_at'  => now()->subHours(24),
         ]);
 
         $trade = $this->makeTrade(
             entry: 0.5,
             stopLoss: 0.45,
             takeProfit: 0.80,
-            signalId: $signal->id
+            marketId: $market->id,
         );
 
-        $trade->load('signal');
+        $trade->load(['signal', 'market']);
 
-        // Price below both SL and momentum trigger
+        // Price di bawah stop loss — stop loss harus menang dari momentum
         $decision = $this->engine->evaluate($trade, 0.40);
 
         $this->assertSame(SmartExitDecision::FULL_EXIT, $decision->action);
         $this->assertStringContainsString('Stop loss', $decision->reason);
+    }
+
+    #[\PHPUnit\Framework\Attributes\Test]
+    public function it_does_not_trigger_momentum_exit_when_no_24h_snapshot(): void
+    {
+        $settings = PaperTradeSetting::current();
+        $settings->enable_smart_exit = true;
+        $settings->save();
+
+        $market = Market::factory()->create(['end_date' => now()->addDays(60)]);
+
+        // Hanya snapshot terkini, tidak ada snapshot 24h lalu
+        \App\Models\MarketSnapshot::factory()->create([
+            'market_id'       => $market->id,
+            'probability_yes' => 0.20,  // price sangat rendah, tapi tidak ada pembanding
+            'snapshotted_at'  => now(),
+        ]);
+
+        $trade = $this->makeTrade(
+            entry: 0.5,
+            stopLoss: 0.10,   // jauh agar stop loss tidak trigger
+            takeProfit: 0.80,
+            marketId: $market->id,
+        );
+
+        $trade->load(['signal', 'market']);
+        $decision = $this->engine->evaluate($trade, 0.20);
+
+        // Tidak boleh trigger momentum exit karena tidak ada data 24h
+        $this->assertNotSame(SmartExitDecision::PARTIAL_EXIT_50, $decision->action,
+            'Momentum exit tidak boleh trigger jika tidak ada snapshot 24h');
     }
 
     // =========================================================================

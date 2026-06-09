@@ -1,7 +1,7 @@
 <?php
-
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
@@ -19,15 +19,17 @@ return new class extends Migration
             WHERE status != UPPER(status)
         ");
 
-        DB::statement("
-            ALTER TABLE paper_trades
-            ALTER COLUMN status SET DEFAULT 'OPEN'
-        ");
-
-        DB::statement("
-            COMMENT ON COLUMN paper_trades.status IS
-            'OPEN | PARTIAL | CLOSED | STOPPED | TAKE_PROFIT | SMART_EXIT | EXPIRED'
-        ");
+        // PostgreSQL only
+        if (DB::getDriverName() === 'pgsql') {
+            DB::statement("
+                ALTER TABLE paper_trades
+                ALTER COLUMN status SET DEFAULT 'OPEN'
+            ");
+            DB::statement("
+                COMMENT ON COLUMN paper_trades.status IS
+                'OPEN | PARTIAL | CLOSED | STOPPED | TAKE_PROFIT | SMART_EXIT | EXPIRED'
+            ");
+        }
     }
 
     public function down(): void
@@ -38,9 +40,11 @@ return new class extends Migration
             WHERE status = UPPER(status)
         ");
 
-        DB::statement("
-            ALTER TABLE paper_trades
-            ALTER COLUMN status SET DEFAULT 'open'
-        ");
+        if (DB::getDriverName() === 'pgsql') {
+            DB::statement("
+                ALTER TABLE paper_trades
+                ALTER COLUMN status SET DEFAULT 'open'
+            ");
+        }
     }
 };

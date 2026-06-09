@@ -1,5 +1,64 @@
 <?php
 
+/**
+ * PATCH #1 (lanjutan) — SmartExitMonitorJob.php
+ *
+ * FILE: app/Jobs/SmartExitMonitorJob.php
+ *   (atau app/Console/Commands/SmartExitMonitorJob.php sesuai lokasi aktual)
+ *
+ * ROOT CAUSE
+ * ----------
+ * executePartialExit() menulis EVENT_PARTIAL_CLOSE dengan:
+ *   - shares_affected = $sharesToClose  (sama dengan EVENT_TP1)
+ *   - pnl_realized    = $pnl            (sama dengan EVENT_TP1)
+ *
+ * Setelah EVENT_PARTIAL_CLOSE dikeluarkan dari CLOSING_EVENTS (Patch #1),
+ * nilai pnl_realized dan shares_affected di EVENT_PARTIAL_CLOSE menjadi
+ * "dead weight" — tidak dihitung tapi menyesatkan jika dibaca manual.
+ *
+ * FIX
+ * ---
+ * EVENT_PARTIAL_CLOSE ditulis dengan pnl_realized = 0, shares_affected = 0.
+ * Fungsinya murni sebagai audit trail / label tampilan di UI.
+ * Accounting sepenuhnya ada di EVENT_TP1 / EVENT_TP2.
+ *
+ * DIFF executePartialExit() — hanya bagian yang berubah:
+ *
+ * SEBELUM:
+ *   if ($isTp1 || $isTp2) {
+ *       PaperTradeHistory::create([
+ *           ...
+ *           'shares_affected' => $sharesToClose,  // ← inflate sharesRemaining()
+ *           'pnl_realized'    => $pnl,             // ← inflate getTotalRealizedPnl()
+ *           ...
+ *       ]);
+ *   }
+ *
+ * SESUDAH:
+ *   if ($isTp1 || $isTp2) {
+ *       PaperTradeHistory::create([
+ *           ...
+ *           'shares_affected' => 0,   // ← tidak ikut sharesRemaining()
+ *           'pnl_realized'    => 0,   // ← tidak ikut getTotalRealizedPnl()
+ *           ...
+ *       ]);
+ *   }
+ *
+ * RISIKO
+ * ------
+ * LOW: Hanya nilai yang ditulis ke DB yang berubah, bukan logic pencabangan.
+ * UI yang menampilkan history rows masih bisa menampilkan EVENT_PARTIAL_CLOSE
+ * sebagai label "Partial close X% at TP1" tanpa bergantung pada nilai numeriknya.
+ *
+ * JUGA DIPERBAIKI DI FILE INI
+ * ---------------------------
+ * - BUG #4: Tambahkan ROI floor -100% pada executePartialExit dan executeFullExit
+ * - BUG #4: Tambahkan log warning jika sharesRemaining() < 0 (tidak mungkin terjadi
+ *           setelah fix, tapi sebagai safety net)
+ * - Duplicate key 'exit_price' dan 'holding_period_hours' di array update dihapus
+ *   (typo yang ada di kode asli)
+ */
+
 declare(strict_types=1);
 
 namespace App\Jobs;
@@ -7,8 +66,8 @@ namespace App\Jobs;
 use App\Models\PaperTrade;
 use App\Models\PaperTradeHistory;
 use App\Models\PaperTradeSetting;
-use App\Services\PaperTrading\SmartExitDecision;
 use App\Services\PaperTrading\SmartExitEngineService;
+use App\Services\PaperTrading\SmartExitDecision;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -17,22 +76,6 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
-/**
- * SmartExitMonitorJob
- *
- * Runs every minute via scheduler.
- * Monitors all OPEN and PARTIAL trades and executes exit actions.
- *
- * Per trade priority:
- *   1. Stop Loss   → FULL_EXIT  → status: STOPPED
- *   2. TP1         → PARTIAL    → status: PARTIAL + TP1 event
- *   3. TP2         → PARTIAL    → status: PARTIAL + TP2 event
- *   4. Breakeven   → UPDATE SL  → BREAKEVEN_MOVED event
- *   5. Smart Exit  → PARTIAL or FULL → SMART_EXIT event
- *
- * Never executes multiple actions per trade per cycle.
- * Never skips history recording.
- */
 final class SmartExitMonitorJob implements ShouldQueue
 {
     use Dispatchable;
@@ -87,7 +130,6 @@ final class SmartExitMonitorJob implements ShouldQueue
 
     private function processTrade(PaperTrade $trade, SmartExitEngineService $engine): bool
     {
-        // Step 1: Get current price
         $currentPrice = $this->getCurrentPrice($trade);
 
         if ($currentPrice <= 0) {
@@ -97,17 +139,14 @@ final class SmartExitMonitorJob implements ShouldQueue
             return false;
         }
 
-        // Step 2: Update current_price and unrealized PnL on trade
         $this->updateCurrentPrice($trade, $currentPrice);
 
-        // Step 3: Evaluate exit conditions
         $decision = $engine->evaluate($trade, $currentPrice);
 
         if ($decision->isNoAction()) {
             return false;
         }
 
-        // Step 4: Execute decision
         Log::info('[SmartExitMonitor] Executing exit decision', [
             'trade_id' => $trade->id,
             'action'   => $decision->action,
@@ -144,21 +183,32 @@ final class SmartExitMonitorJob implements ShouldQueue
     {
         DB::transaction(function () use ($trade, $currentPrice, $reason) {
             $sharesRemaining = $trade->sharesRemaining();
-            $pnl             = $this->calcPnl($trade, $currentPrice, $sharesRemaining);
-            $isStopLoss      = str_contains(strtolower($reason), 'stop loss');
-            $isSmart         = str_contains(strtolower($reason), 'momentum')
+
+            // BUG #4 INVARIANT: sharesRemaining tidak boleh negatif
+            if ($sharesRemaining < 0) {
+                Log::warning('[SmartExitMonitor] INVARIANT VIOLATION: sharesRemaining < 0', [
+                    'trade_id'        => $trade->id,
+                    'sharesRemaining' => $sharesRemaining,
+                    'shares_original' => $trade->shares,
+                ]);
+                $sharesRemaining = 0.0;
+            }
+
+            $pnl        = $this->calcPnl($trade, $currentPrice, $sharesRemaining);
+            $isStopLoss = str_contains(strtolower($reason), 'stop loss');
+            $isSmart    = str_contains(strtolower($reason), 'momentum')
                 || str_contains(strtolower($reason), 'liquidity')
                 || str_contains(strtolower($reason), 'spread')
                 || str_contains(strtolower($reason), 'expiry')
                 || str_contains(strtolower($reason), 'signal reversal');
 
-            $eventType  = $isStopLoss ? PaperTradeHistory::EVENT_STOP_LOSS
-                        : ($isSmart   ? PaperTradeHistory::EVENT_SMART_EXIT
-                                      : PaperTradeHistory::EVENT_CLOSED);
+            $eventType = $isStopLoss ? PaperTradeHistory::EVENT_STOP_LOSS
+                       : ($isSmart   ? PaperTradeHistory::EVENT_SMART_EXIT
+                                     : PaperTradeHistory::EVENT_CLOSED);
 
-            $newStatus  = $isStopLoss ? PaperTrade::STATUS_STOPPED
-                        : ($isSmart   ? PaperTrade::STATUS_SMART_EXIT
-                                      : PaperTrade::STATUS_CLOSED);
+            $newStatus = $isStopLoss ? PaperTrade::STATUS_STOPPED
+                       : ($isSmart   ? PaperTrade::STATUS_SMART_EXIT
+                                     : PaperTrade::STATUS_CLOSED);
 
             PaperTradeHistory::create([
                 'paper_trade_id'  => $trade->id,
@@ -170,25 +220,36 @@ final class SmartExitMonitorJob implements ShouldQueue
             ]);
 
             $totalPnl = $this->getTotalRealizedPnl($trade) + $pnl;
-            $roi      = (float) $trade->position_size_usd > 0
+
+            // BUG #4 INVARIANT: ROI tidak boleh di bawah -100%
+            $rawRoi = (float) $trade->position_size_usd > 0
                 ? $totalPnl / (float) $trade->position_size_usd
-                : 0;
+                : 0.0;
+            $roi = max(-1.0, $rawRoi);
+
+            if ($rawRoi < -1.0) {
+                Log::warning('[SmartExitMonitor] INVARIANT VIOLATION: ROI < -100%', [
+                    'trade_id'  => $trade->id,
+                    'raw_roi'   => $rawRoi,
+                    'clamped'   => $roi,
+                    'total_pnl' => $totalPnl,
+                ]);
+            }
 
             $trade->update([
-                'exit_price'          => $currentPrice,
-                'pnl_usd'             => $totalPnl,
-                'roi'                 => $roi,
-                'status'              => $newStatus,
-                'exit_reason'         => $eventType,
-                'smart_exit_reason'   => $isSmart ? $reason : null,
-                'holding_period_hours'=> $trade->holdingHours(),
-                'holding_period_hours'=> $trade->holdingHours(),
-                'exited_at'           => now(),
-                'outcome'             => $totalPnl >= 0 ? 'win' : 'loss',
+                'exit_price'           => $currentPrice,
+                'pnl_usd'              => $totalPnl,
+                'roi'                  => $roi,
+                'status'               => $newStatus,
+                'exit_reason'          => $eventType,
+                'smart_exit_reason'    => $isSmart ? $reason : null,
+                'holding_period_hours' => $trade->holdingHours(),
+                'exited_at'            => now(),
+                'outcome'              => $totalPnl >= 0 ? 'win' : 'loss',
             ]);
         });
-
     }
+
     // -------------------------------------------------------------------------
 
     private function executePartialExit(
@@ -203,7 +264,15 @@ final class SmartExitMonitorJob implements ShouldQueue
             $isTp1           = str_contains($reason, 'TP1');
             $isTp2           = str_contains($reason, 'TP2');
 
-            // Determine close percent based on trigger
+            // BUG #4 INVARIANT: sharesRemaining tidak boleh negatif
+            if ($sharesRemaining < 0) {
+                Log::warning('[SmartExitMonitor] INVARIANT VIOLATION: sharesRemaining < 0 on partial exit', [
+                    'trade_id'        => $trade->id,
+                    'sharesRemaining' => $sharesRemaining,
+                ]);
+                $sharesRemaining = 0.0;
+            }
+
             if ($isTp1) {
                 $closePct  = (float) ($settings->partial_tp1_percent ?? 50);
                 $eventType = PaperTradeHistory::EVENT_TP1;
@@ -211,7 +280,6 @@ final class SmartExitMonitorJob implements ShouldQueue
                 $closePct  = (float) ($settings->partial_tp2_percent ?? 30);
                 $eventType = PaperTradeHistory::EVENT_TP2;
             } else {
-                // Smart exit partial
                 $closePct  = 50.0;
                 $eventType = PaperTradeHistory::EVENT_SMART_EXIT;
             }
@@ -223,7 +291,11 @@ final class SmartExitMonitorJob implements ShouldQueue
 
             $pnl = $this->calcPnl($trade, $currentPrice, $sharesToClose);
 
-            // Write primary event (TP1, TP2, or SMART_EXIT)
+            // --- Accounting event: TP1 / TP2 / SMART_EXIT ---
+            // Ini satu-satunya record yang masuk CLOSING_EVENTS.
+            // pnl_realized dan shares_affected dipakai oleh:
+            //   - getTotalRealizedPnl()
+            //   - sharesRemaining()
             PaperTradeHistory::create([
                 'paper_trade_id'  => $trade->id,
                 'event_type'      => $eventType,
@@ -233,28 +305,43 @@ final class SmartExitMonitorJob implements ShouldQueue
                 'reason'          => $reason,
             ]);
 
-            // Write PARTIAL_CLOSE event for TP1/TP2
+            // --- Audit/display event: PARTIAL_CLOSE (TP1/TP2 only) ---
+            // PATCH #1 FIX: pnl_realized = 0, shares_affected = 0
+            // EVENT_PARTIAL_CLOSE tidak masuk CLOSING_EVENTS.
+            // Record ini hanya untuk tampilan di trade history UI.
+            // JANGAN ubah nilai 0 ini — ini adalah fix untuk double-count bug.
             if ($isTp1 || $isTp2) {
                 PaperTradeHistory::create([
                     'paper_trade_id'  => $trade->id,
                     'event_type'      => PaperTradeHistory::EVENT_PARTIAL_CLOSE,
                     'price_at_event'  => $currentPrice,
-                    'shares_affected' => $sharesToClose,
-                    'pnl_realized'    => $pnl,
+                    'shares_affected' => 0,   // FIX: was $sharesToClose — caused double-count in sharesRemaining()
+                    'pnl_realized'    => 0,   // FIX: was $pnl — caused double-count in getTotalRealizedPnl()
                     'reason'          => "Partial close {$closePct}% at {$eventType}",
                 ]);
             }
 
-            // Check if fully closed after this partial
+            // Cek apakah posisi sudah habis setelah partial ini
             $newRemaining = $sharesRemaining - $sharesToClose;
             $newStatus    = $newRemaining <= 0.000001
                 ? PaperTrade::STATUS_CLOSED
                 : PaperTrade::STATUS_PARTIAL;
 
             $totalPnl = $this->getTotalRealizedPnl($trade) + $pnl;
-            $roi      = (float) $trade->position_size_usd > 0
+
+            // BUG #4 INVARIANT: ROI tidak boleh di bawah -100%
+            $rawRoi = (float) $trade->position_size_usd > 0
                 ? $totalPnl / (float) $trade->position_size_usd
-                : 0;
+                : 0.0;
+            $roi = max(-1.0, $rawRoi);
+
+            if ($rawRoi < -1.0) {
+                Log::warning('[SmartExitMonitor] INVARIANT VIOLATION: ROI < -100% on partial exit', [
+                    'trade_id'  => $trade->id,
+                    'raw_roi'   => $rawRoi,
+                    'total_pnl' => $totalPnl,
+                ]);
+            }
 
             $trade->update([
                 'status'  => $newStatus,
@@ -264,7 +351,7 @@ final class SmartExitMonitorJob implements ShouldQueue
                     'exit_price'           => $currentPrice,
                     'holding_period_hours' => $trade->holdingHours(),
                     'outcome'              => $totalPnl >= 0 ? 'win' : 'loss',
-                    'exit_price'           => $currentPrice,
+                    'exited_at'            => now(),
                 ] : []),
             ]);
         });
@@ -286,7 +373,6 @@ final class SmartExitMonitorJob implements ShouldQueue
                 'reason'          => $reason,
             ]);
 
-            // Move stop loss to entry price
             $trade->update([
                 'stop_loss_price' => $entryPrice,
             ]);
@@ -297,10 +383,6 @@ final class SmartExitMonitorJob implements ShouldQueue
     // Helpers
     // =========================================================================
 
-    /**
-     * Get current price from latest market snapshot.
-     * Falls back to trade's stored current_price.
-     */
     private function getCurrentPrice(PaperTrade $trade): float
     {
         $snapshot = $trade->market?->snapshots()?->latest()->first();
@@ -312,31 +394,22 @@ final class SmartExitMonitorJob implements ShouldQueue
         return (float) ($trade->current_price ?? 0);
     }
 
-    /**
-     * Update current_price and unrealized PnL without triggering exit logic.
-     */
     private function updateCurrentPrice(PaperTrade $trade, float $currentPrice): void
     {
         $sharesRemaining = $trade->sharesRemaining();
         $unrealizedPnl   = ($currentPrice - (float) $trade->entry_price) * $sharesRemaining;
 
         $trade->update([
-            'current_price'     => $currentPrice,
+            'current_price'      => $currentPrice,
             'unrealized_pnl_usd' => round($unrealizedPnl, 4),
         ]);
     }
 
-    /**
-     * Calculate PnL for a given number of shares at exit price.
-     */
     private function calcPnl(PaperTrade $trade, float $exitPrice, float $shares): float
     {
         return round(($exitPrice - (float) $trade->entry_price) * $shares, 4);
     }
 
-    /**
-     * Sum of all realized PnL from history (excluding current event).
-     */
     private function getTotalRealizedPnl(PaperTrade $trade): float
     {
         return (float) $trade->history()

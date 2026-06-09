@@ -1,52 +1,102 @@
 <?php
 
+/**
+ * PATCH #2 — SmartExitEngineService.php
+ *
+ * FILE: app/Services/SmartExitEngineService.php
+ *
+ * ROOT CAUSE
+ * ----------
+ * isMomentumReversing() membaca $trade->signal->momentum_24h_percent.
+ * Nilai ini adalah snapshot data SAAT SIGNAL DIBUAT, bukan kondisi saat ini.
+ *
+ * Dampak:
+ * - Signal yang dibuat saat momentum = -15% akan langsung menutup trade
+ *   di siklus monitoring pertama (1-5 menit setelah dibuka)
+ * - Avg Holding Time = 0.02 jam (~1.2 menit) disebabkan oleh ini
+ * - normalizeMomentum() menggunakan abs(), sehingga momentum -15%
+ *   berkontribusi score tinggi (diterima) tapi langsung ditutup (ironi)
+ *
+ * FIX
+ * ---
+ * isMomentumReversing() harus membaca dari sumber data terkini.
+ *
+ * Sumber data yang tersedia:
+ *   1. MarketSnapshot: probability_yes, liquidity_usd, spread, volume — TERSEDIA
+ *   2. MarketDailyStat: momentum_24h_percent — tersedia tapi hanya ada 1 row per hari
+ *   3. Signal (lama): momentum_24h_percent — data statis, jangan dipakai
+ *
+ * MarketSnapshot TIDAK punya kolom momentum_24h_percent.
+ * MarketDailyStat punya, tapi perlu join.
+ *
+ * STRATEGI FIX:
+ * Hitung momentum sendiri dari dua snapshot terbaru:
+ *   momentum = (latest_price - price_24h_ago) / price_24h_ago * 100
+ *
+ * Ini lebih akurat dari MarketDailyStat (yang hanya update harian)
+ * dan sepenuhnya real-time berdasarkan data yang sudah ada.
+ *
+ * FALLBACK:
+ * - Jika snapshot terbaru tidak ada → return false (tidak trigger exit)
+ * - Jika snapshot 24h lalu tidak ada → return false (data tidak cukup)
+ * - Threshold tetap -10% (tidak berubah)
+ *
+ * DIFF isMomentumReversing() — method yang berubah:
+ *
+ * SEBELUM:
+ *   private function isMomentumReversing(PaperTrade $trade): bool
+ *   {
+ *       $signal = $trade->signal;
+ *       if (! $signal || $signal->momentum_24h_percent === null) {
+ *           return false;
+ *       }
+ *       return (float) $signal->momentum_24h_percent < -10.0;
+ *   }
+ *
+ * SESUDAH: lihat implementasi di bawah.
+ *
+ * TEST IMPLIKASI
+ * --------------
+ * Test existing "it_triggers_partial_exit_on_momentum_reversal" perlu diupdate:
+ * - Hapus setup signal dengan momentum_24h_percent = -15
+ * - Buat dua MarketSnapshot: satu "sekarang" dan satu "24 jam lalu"
+ * - Lihat test file patch-05 untuk versi yang diperbarui
+ *
+ * RISIKO
+ * ------
+ * MEDIUM: Logic berubah dari "baca field" menjadi "query dua snapshot".
+ * - Ada N+1 query risk per trade per siklus monitoring
+ * - Mitigasi: SmartExitMonitor sudah eager load ->with(['signal', 'market', 'history'])
+ *   tapi BELUM eager load snapshots. Perlu tambah 'market.snapshots' pada eager load,
+ *   atau gunakan latestSnapshot relationship yang sudah ada.
+ * - Untuk MVP, query per trade per siklus masih acceptable (jumlah trade terbatas)
+ *
+ * RESET DATA: TIDAK diperlukan untuk patch ini (logic change, bukan data fix).
+ */
+
 declare(strict_types=1);
 
 namespace App\Services\PaperTrading;
 
+use App\Models\Market;
+use App\Models\MarketSnapshot;
 use App\Models\PaperTrade;
 use App\Models\PaperTradeHistory;
+use App\Models\PaperTradeSetting;
 use App\Models\Signal;
 
-/**
- * SmartExitEngineService
- *
- * Evaluates a single open trade against smart exit rules.
- * Returns a SmartExitDecision — never executes directly.
- * Execution is handled by SmartExitMonitorJob.
- *
- * Priority order (return immediately after first match):
- *   1. Stop Loss
- *   2. Take Profit (TP1, TP2)
- *   3. Breakeven move
- *   4. Smart Exit rules
- *
- * Smart Exit Rules (no AI — simple rules only):
- *   Rule 1: Momentum reversal   < -10%        → PARTIAL_EXIT_50
- *   Rule 2: Liquidity < 50% of entry          → PARTIAL_EXIT_50
- *   Rule 3: Spread > 2x entry spread          → PARTIAL_EXIT_50
- *   Rule 4: Expiry within 6 hours             → FULL_EXIT
- *   Rule 5: Opposite signal with higher score → FULL_EXIT
- */
 final class SmartExitEngineService
 {
     // =========================================================================
     // Main Evaluation
     // =========================================================================
 
-    /**
-     * Evaluate a trade against all exit conditions.
-     * Returns the highest-priority action found, or NO_ACTION.
-     *
-     * @param  PaperTrade  $trade         Trade with current_price already updated
-     * @param  float       $currentPrice  Latest market price
-     */
     public function evaluate(PaperTrade $trade, float $currentPrice): SmartExitDecision
     {
-        $entryPrice  = (float) $trade->entry_price;
-        $stopLoss    = $trade->stop_loss_price  ? (float) $trade->stop_loss_price  : null;
-        $takeProfit  = $trade->take_profit_price ? (float) $trade->take_profit_price : null;
-        $breakeven   = $trade->breakeven_price   ? (float) $trade->breakeven_price   : null;
+        $entryPrice = (float) $trade->entry_price;
+        $stopLoss   = $trade->stop_loss_price  ? (float) $trade->stop_loss_price  : null;
+        $takeProfit = $trade->take_profit_price ? (float) $trade->take_profit_price : null;
+        $breakeven  = $trade->breakeven_price   ? (float) $trade->breakeven_price   : null;
 
         // --- Priority 1: Stop Loss ---
         if ($stopLoss !== null && $currentPrice <= $stopLoss) {
@@ -57,7 +107,6 @@ final class SmartExitEngineService
 
         // --- Priority 2: Take Profit ---
         if ($takeProfit !== null && $currentPrice >= $takeProfit) {
-            // Check if TP1 already fired — if so, check TP2
             if ($this->hasTp1Fired($trade)) {
                 $tp2 = $this->getTp2Price($trade, $entryPrice);
                 if ($tp2 !== null && $currentPrice >= $tp2) {
@@ -98,27 +147,22 @@ final class SmartExitEngineService
 
     private function evaluateSmartRules(PaperTrade $trade, float $currentPrice): SmartExitDecision
     {
-        // Rule 4: Near expiry (highest urgency among smart rules)
         if ($this->isNearExpiry($trade)) {
             return SmartExitDecision::fullExit('Near expiry: less than 6 hours remaining');
         }
 
-        // Rule 5: Signal reversal
         if ($this->hasOppositeSignal($trade)) {
             return SmartExitDecision::fullExit('Signal reversal: opposite signal with higher score detected');
         }
 
-        // Rule 1: Momentum reversal
         if ($this->isMomentumReversing($trade)) {
             return SmartExitDecision::partialExit('Momentum reversal: momentum < -10%');
         }
 
-        // Rule 2: Liquidity deterioration
         if ($this->isLiquidityDeteriorating($trade)) {
             return SmartExitDecision::partialExit('Liquidity deterioration: < 50% of entry liquidity');
         }
 
-        // Rule 3: Spread widening
         if ($this->isSpreadWidening($trade)) {
             return SmartExitDecision::partialExit('Spread widening: > 2x entry spread');
         }
@@ -131,21 +175,57 @@ final class SmartExitEngineService
     // =========================================================================
 
     /**
-     * Rule 1: Momentum < -10% indicates reversal.
-     * Reads current momentum from market's latest snapshot via signal.
+     * Rule 1: Momentum reversal — probability dropped >10% in last 24 hours.
+     *
+     * PATCH #2 FIX: Sebelumnya membaca $trade->signal->momentum_24h_percent
+     * yang merupakan data statis saat signal dibuat. Sekarang menghitung
+     * momentum dari dua snapshot terbaru secara real-time.
+     *
+     * Formula: (price_now - price_24h_ago) / price_24h_ago * 100
+     *
+     * Fallback: return false jika data snapshot tidak tersedia.
      */
     private function isMomentumReversing(PaperTrade $trade): bool
     {
-        $signal = $trade->signal;
-        if (! $signal || $signal->momentum_24h_percent === null) {
+        $market = $trade->market;
+        if (! $market) {
             return false;
         }
 
-        return (float) $signal->momentum_24h_percent < -10.0;
+        // Snapshot paling baru
+        $latestSnapshot = $market->snapshots()->latest('snapshotted_at')->first();
+        if (! $latestSnapshot) {
+            return false;
+        }
+
+        // Snapshot mendekati 24 jam lalu (window ±1 jam untuk toleransi gap collector)
+        $snapshot24hAgo = $market->snapshots()
+            ->where('snapshotted_at', '<=', now()->subHours(23))
+            ->where('snapshotted_at', '>=', now()->subHours(25))
+            ->latest('snapshotted_at')
+            ->first();
+
+        if (! $snapshot24hAgo) {
+            // Fallback: tidak ada data 24h lalu → tidak trigger exit
+            // Ini lebih aman daripada false positive yang menutup trade prematur
+            return false;
+        }
+
+        $priceNow    = (float) $latestSnapshot->probability_yes;
+        $price24hAgo = (float) $snapshot24hAgo->probability_yes;
+
+        if ($price24hAgo <= 0) {
+            return false;
+        }
+
+        $momentum24h = (($priceNow - $price24hAgo) / $price24hAgo) * 100.0;
+
+        return $momentum24h < -10.0;
     }
 
     /**
      * Rule 2: Liquidity < 50% of liquidity at signal time.
+     * Tidak berubah — sudah membaca current snapshot dengan benar.
      */
     private function isLiquidityDeteriorating(PaperTrade $trade): bool
     {
@@ -166,6 +246,7 @@ final class SmartExitEngineService
 
     /**
      * Rule 3: Spread > 2x spread at signal time.
+     * Tidak berubah — sudah membaca current snapshot dengan benar.
      */
     private function isSpreadWidening(PaperTrade $trade): bool
     {
@@ -195,26 +276,15 @@ final class SmartExitEngineService
         }
 
         $endDate = \Carbon\Carbon::parse($market->end_date);
-        // Already expired
         if ($endDate->isPast()) {
             return true;
         }
 
-        // Less than 6 hours remaining
         return now()->diffInHours($endDate, absolute: false) < 6;
     }
 
     /**
-     * Rule 5: Opposite direction signal exists (not expired) for same market.
-     *
-     * Triggers FULL_EXIT when an opposing signal appears — interpreted as a
-     * market reversal. Score comparison is intentionally omitted: signals reach
-     * 'pending' status only after passing SignalRankerService minimum_signal_score
-     * filter. Any surviving pending opposite signal is a valid reversal indicator.
-     *
-     * Note: Signal.score is not a persistent DB column — it is a runtime key
-     * added by SignalRankerService::rank() via array_merge(). Score-based
-     * comparison requires persisting score to signals table (Sprint 4 item).
+     * Rule 5: Opposite direction signal exists for same market.
      */
     private function hasOppositeSignal(PaperTrade $trade): bool
     {
@@ -230,7 +300,7 @@ final class SmartExitEngineService
     }
 
     // =========================================================================
-    // History Checks (prevent duplicate actions)
+    // History Checks
     // =========================================================================
 
     public function hasTp1Fired(PaperTrade $trade): bool
@@ -258,32 +328,21 @@ final class SmartExitEngineService
     // Market Data Helpers
     // =========================================================================
 
-    /**
-     * Get current liquidity from latest market snapshot.
-     * Returns null if no snapshot available.
-     */
     private function getCurrentLiquidity(PaperTrade $trade): ?float
     {
         $snapshot = $trade->market?->snapshots()?->latest()->first();
         return $snapshot ? (float) ($snapshot->liquidity_usd ?? 0) : null;
     }
 
-    /**
-     * Get current spread from latest market snapshot.
-     */
     private function getCurrentSpread(PaperTrade $trade): ?float
     {
         $snapshot = $trade->market?->snapshots()?->latest()->first();
         return $snapshot ? (float) ($snapshot->spread ?? 0) : null;
     }
 
-    /**
-     * Calculate TP2 price from trade history and settings.
-     * TP2 = entry + (risk_per_share * take_profit_r2)
-     */
     private function getTp2Price(PaperTrade $trade, float $entryPrice): ?float
     {
-        $settings = \App\Models\PaperTradeSetting::current();
+        $settings = PaperTradeSetting::current();
 
         if (! $settings->enable_take_profit || $settings->take_profit_r2 === null) {
             return null;
@@ -302,11 +361,8 @@ final class SmartExitEngineService
         return round($entryPrice + ($riskPerShare * (float) $settings->take_profit_r2), 8);
     }
 
-    /**
-     * Check if smart exit is enabled in settings.
-     */
     private function isSmartExitEnabled(PaperTrade $trade): bool
     {
-        return (bool) \App\Models\PaperTradeSetting::current()->enable_smart_exit;
+        return (bool) PaperTradeSetting::current()->enable_smart_exit;
     }
 }
