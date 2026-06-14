@@ -54,6 +54,8 @@ class Market(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     condition_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    clob_token_id_yes: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    clob_token_id_no: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     slug: Mapped[Optional[str]] = mapped_column(String(200), unique=True, nullable=True)
     question: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

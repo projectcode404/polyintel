@@ -93,6 +93,8 @@ class RawMarket:
     spread: Decimal | None
     price_change_1h: Decimal | None
     price_change_1d: Decimal | None
+    clob_token_id_yes: str | None
+    clob_token_id_no: str | None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
@@ -492,6 +494,59 @@ class PolymarketService:
                 log.warning("market_parse_error", condition_id=m.get("conditionId", "unknown"), error=str(exc))
         return parsed
 
+    def _extract_clob_token_ids(self, data: dict[str, Any]) -> tuple[str | None, str | None]:
+        """
+        Extract (yes_token_id, no_token_id) from Gamma API's `clobTokenIds`
+        field, matched against `outcomes` by label rather than array index
+        — outcome ordering is not guaranteed to be Yes-first for every
+        market (e.g. "Up"/"Down" markets).
+
+        clobTokenIds and outcomes are both JSON-encoded string arrays in
+        the Gamma response, e.g.:
+          clobTokenIds = '["1234...", "5678..."]'
+          outcomes     = '["Yes", "No"]'
+
+        Returns (None, None) if fields are missing or malformed —
+        callers must handle this gracefully (live trading not possible
+        for this market until token IDs are available).
+        """
+        raw_token_ids = data.get("clobTokenIds")
+        raw_outcomes = data.get("outcomes")
+
+        if not raw_token_ids or not raw_outcomes:
+            return None, None
+
+        try:
+            token_ids = json.loads(raw_token_ids) if isinstance(raw_token_ids, str) else raw_token_ids
+            outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+        except (json.JSONDecodeError, TypeError):
+            return None, None
+
+        if not isinstance(token_ids, list) or not isinstance(outcomes, list):
+            return None, None
+
+        if len(token_ids) != len(outcomes):
+            return None, None
+
+        yes_token_id: str | None = None
+        no_token_id: str | None = None
+
+        for token_id, outcome in zip(token_ids, outcomes):
+            outcome_lower = str(outcome).strip().lower()
+            if outcome_lower == "yes":
+                yes_token_id = str(token_id)
+            elif outcome_lower == "no":
+                no_token_id = str(token_id)
+
+        # Fallback for binary markets with non-Yes/No labels (e.g. "Up"/"Down"):
+        # treat index 0 as the "yes side" and index 1 as the "no side",
+        # consistent with how probability_yes is derived from outcomePrices[0].
+        if yes_token_id is None and no_token_id is None and len(token_ids) == 2:
+            yes_token_id = str(token_ids[0])
+            no_token_id = str(token_ids[1])
+
+        return yes_token_id, no_token_id
+
     def _parse_gamma_market(self, data: dict[str, Any]) -> RawMarket:
         """
         Normalise Gamma API market response ke RawMarket.
@@ -514,6 +569,7 @@ class PolymarketService:
         probability_yes = self._extract_probability_yes(data)
         tags = self._extract_tags(data)
         category, sub_category = self._classify_market(data, tags)
+        clob_token_id_yes, clob_token_id_no = self._extract_clob_token_ids(data)
 
         return RawMarket(
             condition_id=str(data.get("conditionId") or data.get("condition_id") or ""),
@@ -538,6 +594,8 @@ class PolymarketService:
             spread=self._safe_decimal_or_none(data.get("spread")),
             price_change_1h=self._safe_decimal_or_none(data.get("oneHourPriceChange")),
             price_change_1d=self._safe_decimal_or_none(data.get("oneDayPriceChange")),
+            clob_token_id_yes=clob_token_id_yes,
+            clob_token_id_no=clob_token_id_no,
             raw=data,
         )
 

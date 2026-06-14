@@ -172,6 +172,10 @@ class MarketRepository:
             "price_change_1h":   raw.price_change_1h,
             "price_change_1d":   raw.price_change_1d,
 
+            # CLOB token IDs — required for live trading order placement
+            "clob_token_id_yes": raw.clob_token_id_yes,
+            "clob_token_id_no":  raw.clob_token_id_no,
+
             "is_tracked":        True,
             "last_synced_at":    now,
             "created_at":        now,
