@@ -45,7 +45,7 @@ class PaperTradeAccountingTest extends TestCase
         parent::setUp();
         PaperTradeSetting::current();
         $this->engine  = new SmartExitEngineService();
-        $this->monitor = new SmartExitMonitorJob($this->engine);
+        $this->monitor = new SmartExitMonitorJob();
     }
 
     // =========================================================================

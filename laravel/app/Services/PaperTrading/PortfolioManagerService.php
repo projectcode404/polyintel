@@ -40,6 +40,7 @@ final class PortfolioManagerService
         private readonly SignalRankerService      $rankerService,
         private readonly PositionSizerService     $sizerService,
         private readonly ExitStrategyService      $exitStrategyService,
+        private readonly \App\Services\PortfolioService $portfolioService = new \App\Services\PortfolioService(),
     ) {}
 
     // =========================================================================
@@ -167,7 +168,11 @@ final class PortfolioManagerService
         }
 
         // Guard 5: valid entry price
-        $entryPrice = (float) ($signal['current_price'] ?? $signal['entry_price'] ?? 0);
+        // FIX B: Ambil harga real-time dari markets table, bukan snapshot signal lama
+        $market = \App\Models\Market::find($signal['market_id'] ?? null);
+        $entryPrice = $market && $market->market_probability !== null
+            ? (float) $market->market_probability
+            : (float) ($signal['current_price'] ?? $signal['entry_price'] ?? 0);
 
         if ($entryPrice <= 0) {
             return $this->skip('Invalid entry price: ' . $entryPrice);
@@ -204,7 +209,7 @@ final class PortfolioManagerService
                     'entry_price'                  => $entryPrice,
                     'shares'                       => $shares,
                     'position_size_usd'            => $positionSize,
-                    'fees_usd'                     => 0,
+                    'fees_usd'                     => round($positionSize * $this->portfolioService->getTradingFeePercentage(), 4),
                     'pnl_usd'                      => 0,
                     'roi'                          => 0,
                     'current_price'                => $entryPrice,
@@ -235,6 +240,12 @@ final class PortfolioManagerService
                         (float) ($signal['edge_at_signal'] ?? $signal['edge'] ?? 0)
                     ),
                 ]);
+
+                // FIX A: Tandai signal sebagai FIRED agar tidak diambil ulang di cycle berikutnya
+                if (! empty($signal['id'])) {
+                    \App\Models\Signal::where('id', $signal['id'])
+                        ->update(['status' => \App\Models\Signal::STATUS_FIRED]);
+                }
             });
         } catch (\Throwable $e) {
             Log::error('[PortfolioManager] Failed to open trade', [

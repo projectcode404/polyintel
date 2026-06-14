@@ -108,6 +108,15 @@ final class SmartExitEngineService
         // --- Priority 2: Take Profit ---
         if ($takeProfit !== null && $currentPrice >= $takeProfit) {
             if ($this->hasTp1Fired($trade)) {
+                // BUG FIX: TP2 must only fire ONCE. Without this check,
+                // TP2 re-fires every monitoring cycle as long as
+                // currentPrice >= TP2 price, causing repeated partial
+                // closes (geometric decay of shares) and inflated
+                // cumulative realized PnL — observed as ROI > 1000%.
+                if ($this->hasTp2Fired($trade)) {
+                    return SmartExitDecision::noAction();
+                }
+
                 $tp2 = $this->getTp2Price($trade, $entryPrice);
                 if ($tp2 !== null && $currentPrice >= $tp2) {
                     return SmartExitDecision::partialExit(
@@ -155,11 +164,11 @@ final class SmartExitEngineService
             return SmartExitDecision::fullExit('Signal reversal: opposite signal with higher score detected');
         }
 
-        if ($this->isMomentumReversing($trade)) {
+        if ($this->isMomentumReversing($trade) && ! $this->hasRecentSmartExit($trade)) {
             return SmartExitDecision::partialExit('Momentum reversal: momentum < -10%');
         }
 
-        if ($this->isLiquidityDeteriorating($trade)) {
+        if ($this->isLiquidityDeteriorating($trade) && ! $this->hasRecentSmartExit($trade)) {
             return SmartExitDecision::partialExit('Liquidity deterioration: < 50% of entry liquidity');
         }
 
@@ -324,19 +333,36 @@ final class SmartExitEngineService
             ->exists();
     }
 
+    /**
+     * Prevent momentum partial exit from firing more than once per 30 minutes.
+     */
+    private function hasRecentSmartExit(PaperTrade $trade, int $minutes = 30): bool
+    {
+        $result = PaperTradeHistory::where('paper_trade_id', $trade->id)
+            ->where('event_type', PaperTradeHistory::EVENT_SMART_EXIT)
+            ->where('created_at', '>=', now()->subMinutes($minutes))
+            ->exists();
+        \Illuminate\Support\Facades\Log::debug('[SmartExit] hasRecentSmartExit', [
+            'trade_id' => $trade->id,
+            'result'   => $result,
+            'since'    => now()->subMinutes($minutes)->toDateTimeString(),
+        ]);
+        return $result;
+    }
+
     // =========================================================================
     // Market Data Helpers
     // =========================================================================
 
     private function getCurrentLiquidity(PaperTrade $trade): ?float
     {
-        $snapshot = $trade->market?->snapshots()?->latest()->first();
+        $snapshot = $trade->market?->latestSnapshot;
         return $snapshot ? (float) ($snapshot->liquidity_usd ?? 0) : null;
     }
 
     private function getCurrentSpread(PaperTrade $trade): ?float
     {
-        $snapshot = $trade->market?->snapshots()?->latest()->first();
+        $snapshot = $trade->market?->latestSnapshot;
         return $snapshot ? (float) ($snapshot->spread ?? 0) : null;
     }
 

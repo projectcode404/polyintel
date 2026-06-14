@@ -6,6 +6,7 @@ namespace App\Services\PaperTrading;
 
 use App\Models\PaperTrade;
 use App\Models\PaperTradeSetting;
+use App\Models\Signal;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
@@ -307,7 +308,16 @@ final class SignalRankerService
     /**
      * Pre-fetch all market_ids that have a conflicting (opposite direction) pending signal.
      * Returns Collection keyed by market_id => Collection of directions.
-     * Used to avoid N+1 queries inside applyMarketConstraints filter loop.
+     *
+     * PATCH: Query ALL pending, non-expired signals directly from DB —
+     * regardless of score. This must match exactly what
+     * SmartExitEngineService::hasOppositeSignal() checks at exit time.
+     *
+     * Root cause fixed: previously this only looked at $signals (already
+     * filtered by minimum_signal_score), so a low-score opposite signal
+     * would not be detected here, but WOULD trigger an immediate
+     * "Signal reversal" full exit once SmartExitMonitorJob ran —
+     * causing open -> immediate close churn (PnL ~ 0, wasted trade slots).
      */
     private function getConflictingMarketIds(array $marketIds, Collection $signals): Collection
     {
@@ -315,10 +325,15 @@ final class SignalRankerService
             return collect();
         }
 
-        // Build map of market_id => [directions] from the signals themselves
-        // A conflict exists when same market has both 'yes' and 'no' signals
-        return $signals->groupBy('market_id')->map(
-            fn ($group) => $group->pluck('direction')->map(fn ($d) => strtolower((string) $d))
-        );
+        return Signal::whereIn('market_id', $marketIds)
+            ->where('status', Signal::STATUS_PENDING)
+            ->where(function ($q) {
+                $q->whereNull('expires_at')->orWhere('expires_at', '>', now());
+            })
+            ->get(['market_id', 'direction'])
+            ->groupBy('market_id')
+            ->map(
+                fn ($group) => $group->pluck('direction')->map(fn ($d) => strtolower((string) $d))
+            );
     }
 }

@@ -72,3 +72,5 @@ Thumbs.db
 *.bak
 *.tmp
 scripts/secrets/
+__pycache__/
+*.pyc

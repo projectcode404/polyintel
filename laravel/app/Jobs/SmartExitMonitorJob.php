@@ -66,7 +66,9 @@ namespace App\Jobs;
 use App\Models\PaperTrade;
 use App\Models\PaperTradeHistory;
 use App\Models\PaperTradeSetting;
+use App\Models\TradingAccount;
 use App\Services\PaperTrading\SmartExitEngineService;
+use App\Services\PortfolioService;
 use App\Services\PaperTrading\SmartExitDecision;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -87,7 +89,7 @@ final class SmartExitMonitorJob implements ShouldQueue
     public int $timeout = 60;
 
     public function __construct(
-        private readonly SmartExitEngineService $engine = new SmartExitEngineService()
+        private readonly PortfolioService $portfolioService = new PortfolioService()
     ) {}
 
     // =========================================================================
@@ -97,7 +99,7 @@ final class SmartExitMonitorJob implements ShouldQueue
     public function handle(SmartExitEngineService $engine): void
     {
         $trades = PaperTrade::whereIn('status', PaperTrade::OPEN_STATUSES)
-            ->with(['signal', 'market', 'history', 'market.snapshots' => function ($q) { $q->latest()->limit(1); }])
+            ->with(['signal', 'market', 'market.latestSnapshot', 'history'])
             ->get();
 
         if ($trades->isEmpty()) {
@@ -182,6 +184,7 @@ final class SmartExitMonitorJob implements ShouldQueue
     private function executeFullExit(PaperTrade $trade, float $currentPrice, string $reason): void
     {
         DB::transaction(function () use ($trade, $currentPrice, $reason) {
+            $trade->load('history'); // refresh to include any new events in this cycle
             $sharesRemaining = $trade->sharesRemaining();
 
             // BUG #4 INVARIANT: sharesRemaining tidak boleh negatif
@@ -194,7 +197,9 @@ final class SmartExitMonitorJob implements ShouldQueue
                 $sharesRemaining = 0.0;
             }
 
-            $pnl        = $this->calcPnl($trade, $currentPrice, $sharesRemaining);
+            $grossPnl   = $this->calcPnl($trade, $currentPrice, $sharesRemaining);
+            $exitFee    = $this->calcExitFee($sharesRemaining, $currentPrice);
+            $pnl        = round($grossPnl - $exitFee, 4);
             $isStopLoss = str_contains(strtolower($reason), 'stop loss');
             $isSmart    = str_contains(strtolower($reason), 'momentum')
                 || str_contains(strtolower($reason), 'liquidity')
@@ -246,9 +251,11 @@ final class SmartExitMonitorJob implements ShouldQueue
                 'holding_period_hours' => $trade->holdingHours(),
                 'exited_at'            => now(),
                 'outcome'              => $totalPnl >= 0 ? 'win' : 'loss',
+                'fees_usd'             => (float) $trade->fees_usd + $exitFee,
             ]);
 
             // FIX #1: Kembalikan capital + net PnL ke balance akun
+            // (fee sudah dikurangi dari $pnl di atas)
             $returnedAmount = ($sharesRemaining * (float) $trade->entry_price) + $pnl;
             TradingAccount::where('id', $trade->trading_account_id)
                 ->increment('balance', $returnedAmount);
@@ -265,6 +272,7 @@ final class SmartExitMonitorJob implements ShouldQueue
     ): void {
         DB::transaction(function () use ($trade, $currentPrice, $reason, $engine) {
             $settings        = PaperTradeSetting::current();
+            $trade->load('history'); // refresh to include any new events in this cycle
             $sharesRemaining = $trade->sharesRemaining();
             $isTp1           = str_contains($reason, 'TP1');
             $isTp2           = str_contains($reason, 'TP2');
@@ -293,8 +301,15 @@ final class SmartExitMonitorJob implements ShouldQueue
             if ($sharesToClose <= 0) {
                 return;
             }
+            // If remaining position is dust, close it all instead of partial
+            if ($sharesRemaining < 0.05) {
+                $this->executeFullExit($trade, $currentPrice, 'Dust position — forced full exit');
+                return;
+            }
 
-            $pnl = $this->calcPnl($trade, $currentPrice, $sharesToClose);
+            $grossPnl = $this->calcPnl($trade, $currentPrice, $sharesToClose);
+            $exitFee  = $this->calcExitFee($sharesToClose, $currentPrice);
+            $pnl      = round($grossPnl - $exitFee, 4);
 
             // --- Accounting event: TP1 / TP2 / SMART_EXIT ---
             // Ini satu-satunya record yang masuk CLOSING_EVENTS.
@@ -349,9 +364,10 @@ final class SmartExitMonitorJob implements ShouldQueue
             }
 
             $trade->update([
-                'status'  => $newStatus,
-                'pnl_usd' => $totalPnl,
-                'roi'     => $roi,
+                'status'   => $newStatus,
+                'pnl_usd'  => $totalPnl,
+                'roi'      => $roi,
+                'fees_usd' => (float) $trade->fees_usd + $exitFee,
                 ...($newStatus !== PaperTrade::STATUS_PARTIAL ? [
                     'exit_price'           => $currentPrice,
                     'holding_period_hours' => $trade->holdingHours(),
@@ -361,6 +377,7 @@ final class SmartExitMonitorJob implements ShouldQueue
             ]);
 
             // FIX #1b: Kembalikan capital portion dari shares yang ditutup + PnL partial
+            // (fee sudah dikurangi dari $pnl di atas)
             $returnedAmount = ($sharesToClose * (float) $trade->entry_price) + $pnl;
             TradingAccount::where('id', $trade->trading_account_id)
                 ->increment('balance', $returnedAmount);
@@ -395,7 +412,7 @@ final class SmartExitMonitorJob implements ShouldQueue
 
     private function getCurrentPrice(PaperTrade $trade): float
     {
-        $snapshot = $trade->market?->snapshots->first();
+        $snapshot = $trade->market?->latestSnapshot;
 
         if ($snapshot && (float) $snapshot->probability_yes > 0) {
             return (float) $snapshot->probability_yes;
@@ -418,6 +435,18 @@ final class SmartExitMonitorJob implements ShouldQueue
     private function calcPnl(PaperTrade $trade, float $exitPrice, float $shares): float
     {
         return round(($exitPrice - (float) $trade->entry_price) * $shares, 4);
+    }
+
+    /**
+     * H3 FIX: Calculate exit fee for a given number of shares at exit price.
+     * Previously SmartExitMonitor charged NO fee on TP1/TP2/SmartExit/StopLoss
+     * exits, while PaperTradingService::closeTrade() did — inconsistent and
+     * unrealistic (Polymarket charges fee on both entry and exit).
+     */
+    private function calcExitFee(float $shares, float $exitPrice): float
+    {
+        $feeRate = $this->portfolioService->getTradingFeePercentage();
+        return round($shares * $exitPrice * $feeRate, 4);
     }
 
     private function getTotalRealizedPnl(PaperTrade $trade): float

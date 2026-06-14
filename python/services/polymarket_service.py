@@ -672,7 +672,17 @@ class PolymarketService:
         elif "defi" in tags_lower or "defi" in question:
             sub_category = "defi"
 
-        return "crypto", sub_category
+        # Only return crypto if there's actual crypto signal
+        if sub_category is not None:
+            return "crypto", sub_category
+        # Fallback: check tags for crypto signals
+        crypto_tags = {"bitcoin", "btc", "ethereum", "eth", "solana", "sol",
+                       "bnb", "binance", "xrp", "ripple", "defi", "crypto",
+                       "cryptocurrency"}
+        if tags_lower & crypto_tags:
+            return "crypto", sub_category
+        # Not crypto
+        return "other", None
 
     def _extract_tags(self, data: dict[str, Any]) -> list[str]:
         raw_tags = data.get("tags", [])

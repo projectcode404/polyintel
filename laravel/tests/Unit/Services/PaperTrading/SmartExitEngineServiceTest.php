@@ -88,6 +88,44 @@ class SmartExitEngineServiceTest extends TestCase
         $this->assertNotSame('TP1 hit', $decision->reason ?? '');
     }
 
+    #[\PHPUnit\Framework\Attributes\Test]
+    public function it_does_not_retrigger_tp2_after_it_fired(): void
+    {
+        // BUG REGRESSION TEST: Previously, TP2 had no hasTp2Fired() guard,
+        // so it would re-fire every monitoring cycle as long as
+        // currentPrice >= TP2 price, causing repeated partial closes
+        // and inflated cumulative realized PnL (observed ROI > 1000%).
+        $trade = $this->makeTrade(entry: 0.5, stopLoss: 0.40, takeProfit: 0.60);
+
+        // Simulate TP1 already fired
+        PaperTradeHistory::create([
+            'paper_trade_id'  => $trade->id,
+            'event_type'      => PaperTradeHistory::EVENT_TP1,
+            'price_at_event'  => 0.61,
+            'shares_affected' => 50,
+            'pnl_realized'    => 5.0,
+        ]);
+
+        // Simulate TP2 already fired once
+        PaperTradeHistory::create([
+            'paper_trade_id'  => $trade->id,
+            'event_type'      => PaperTradeHistory::EVENT_TP2,
+            'price_at_event'  => 0.70,
+            'shares_affected' => 15,
+            'pnl_realized'    => 3.0,
+        ]);
+
+        $trade->load('history');
+
+        // Price still >= TP2 price — without the fix, this would fire TP2 again
+        $decision = $this->engine->evaluate($trade, 0.75);
+
+        $this->assertNotSame(SmartExitDecision::PARTIAL_EXIT_50, $decision->action,
+            'TP2 must not re-fire once it has already fired once');
+        $this->assertNotSame('TP2 hit', $decision->reason ?? '',
+            'Decision reason must not be TP2 hit on second evaluation');
+    }
+
     // =========================================================================
     // Breakeven
     // =========================================================================
@@ -171,8 +209,11 @@ class SmartExitEngineServiceTest extends TestCase
         $market = Market::factory()->create(['end_date' => now()->addDays(60)]);
 
         // Signal tanpa momentum (tidak relevan setelah patch)
+        // direction dipin ke 'yes' agar sama dengan trade direction —
+        // mencegah hasOppositeSignal() flaky-true akibat random factory direction
         $signal = Signal::factory()->create([
             'market_id' => $market->id,
+            'direction' => 'yes',
             // momentum_24h_percent sengaja tidak diset — patch tidak membacanya
         ]);
 
