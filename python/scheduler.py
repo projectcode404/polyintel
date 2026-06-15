@@ -66,6 +66,7 @@ _snapshots_collector = None
 _stats_collector     = None
 _signals_collector   = None
 _signal_evaluator    = None    # Sprint 3
+_live_order_executor = None    # Live trading (OrderExecutorJob)
 
 
 def _init_collectors() -> None:
@@ -77,12 +78,16 @@ def _init_collectors() -> None:
     from collectors.stats_collector     import StatsCollector
     from collectors.signal_collector    import SignalCollector
     from services.signal_evaluator      import SignalEvaluator    # Sprint 3
+    from jobs.order_executor_job        import job_execute_live_orders  # Live trading
+
+    global _live_order_executor
 
     _markets_collector   = MarketsCollector()
     _snapshots_collector = SnapshotsCollector()
     _stats_collector     = StatsCollector()
     _signals_collector   = SignalCollector()
     _signal_evaluator    = SignalEvaluator()
+    _live_order_executor = job_execute_live_orders
 
     log.info("collectors_initialised")
 
@@ -212,6 +217,18 @@ def job_collect_signals() -> None:
     except Exception as exc:
         log.exception("job_collect_signals_failed", error=str(exc))
         raise
+
+
+def job_execute_live_orders() -> None:
+    """
+    Execute pending live_trade_orders via Polymarket CLOB (live trading).
+
+    No-op if no wallet is configured (POLYMARKET_WALLET_PRIVATE_KEY empty)
+    — see jobs/order_executor_job.py for details. Runs frequently
+    (short interval) since orders must be executed promptly after
+    Laravel queues them.
+    """
+    _live_order_executor()
 
 
 def job_evaluate_signals() -> None:
@@ -412,6 +429,18 @@ def main() -> None:
         id="evaluate_signals",
         name="Signal Evaluation (Sprint 3)",
         next_run_time=now + startup_delay + _td(seconds=30),
+    )
+
+    # Live trading — execute pending live_trade_orders (Pola A queue).
+    # Short interval: orders must be placed promptly after Laravel
+    # queues them. No-op if no wallet configured (see job docstring).
+    _scheduler.add_job(
+        job_execute_live_orders,
+        trigger="interval",
+        seconds=10,
+        id="execute_live_orders",
+        name="Live Order Execution (CLOB)",
+        next_run_time=now + startup_delay,
     )
 
     # 7. Start

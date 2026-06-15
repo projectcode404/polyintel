@@ -29,3 +29,6 @@ redis==5.0.*
 
 # Structured logging
 structlog==24.4.*
+
+# Polymarket CLOB order execution (live trading)
+py-clob-client==0.34.*

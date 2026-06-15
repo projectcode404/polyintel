@@ -27,6 +27,7 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+      - python/.env  # sensitive: wallet private key — Python only
     volumes:
       - ./python:/app
       - ./python/logs:/app/logs

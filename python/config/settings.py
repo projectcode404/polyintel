@@ -41,6 +41,23 @@ class Settings(BaseSettings):
     polymarket_clob_url: str = "https://clob.polymarket.com"
 
     # -------------------------------------------------------------------------
+    # Live trading (order execution) — wallet credentials
+    # -------------------------------------------------------------------------
+    # Loaded from python/.env (Python container ONLY — never shared with
+    # Laravel containers). Empty string = live trading disabled; jobs must
+    # check for this and skip gracefully, not crash.
+    polymarket_wallet_private_key: str = ""
+    polymarket_wallet_address: str = ""
+
+    # Polygon chain ID — required by ClobClient
+    polymarket_chain_id: int = 137
+
+    # Hard safety cap: reject any order whose size_usd exceeds this value,
+    # regardless of what Laravel queued. Last-line defense against
+    # misconfiguration during live trading testing phase.
+    live_trading_max_order_usd: float = 5.0
+
+    # -------------------------------------------------------------------------
     # Collector schedule
     # -------------------------------------------------------------------------
     snapshot_interval_minutes: int = 5
