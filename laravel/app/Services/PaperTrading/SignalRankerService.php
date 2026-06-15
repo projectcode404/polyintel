@@ -40,6 +40,20 @@ final class SignalRankerService
     private const WEIGHT_LIQUIDITY  = 0.15;
     private const WEIGHT_VOLUME     = 0.10;
 
+    /**
+     * Minimum market liquidity (USD) required to open a trade.
+     *
+     * Markets below this threshold show probability_yes values that
+     * jump between a small set of fixed/cached values rather than
+     * reflecting real order book depth — entry/exit at these prices
+     * is not realistically fillable. A position sized even a few
+     * dollars can represent 10-20% of total market liquidity,
+     * producing fictitious PnL (observed: $1.88 position on a
+     * $12.86-liquidity market generated +1688% ROI from a stale
+     * 0.008 -> 0.4275 -> 0.005 price oscillation).
+     */
+    private const MIN_LIQUIDITY_USD = 1000.0;
+
     // -------------------------------------------------------------------------
     // Normalization Tiers
     // -------------------------------------------------------------------------
@@ -181,6 +195,15 @@ final class SignalRankerService
             $opposite  = $direction === 'yes' ? 'no' : 'yes';
             $hasOpposite = $conflictMarketIds->get($marketId, collect())->contains($opposite);
             if ($hasOpposite) {
+                return false;
+            }
+
+            // Skip markets with insufficient liquidity — prices on these
+            // markets are not realistically fillable and produce
+            // fictitious PnL when a position represents a large
+            // fraction of total market liquidity.
+            $liquidityUsd = (float) ($signal['liquidity_usd'] ?? 0);
+            if ($liquidityUsd < self::MIN_LIQUIDITY_USD) {
                 return false;
             }
 
