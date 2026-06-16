@@ -321,7 +321,7 @@ final class PortfolioDashboardService
     private function formatActiveTrade(PaperTrade $trade): array
     {
         $holdingMinutes = $trade->entered_at
-            ? now()->diffInMinutes($trade->entered_at)
+            ? (int) $trade->entered_at->diffInMinutes(now())
             : 0;
 
         $holdingDisplay = $holdingMinutes < 60
@@ -362,7 +362,7 @@ final class PortfolioDashboardService
     private function formatClosedTrade(PaperTrade $trade): array
     {
         $durationMinutes = ($trade->entered_at && $trade->exited_at)
-            ? $trade->entered_at->diffInMinutes($trade->exited_at)
+            ? (int) $trade->entered_at->diffInMinutes($trade->exited_at)
             : null;
 
         $durationDisplay = null;

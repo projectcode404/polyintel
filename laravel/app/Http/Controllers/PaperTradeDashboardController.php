@@ -100,7 +100,7 @@ final class PaperTradeDashboardController extends Controller
         $paperTrade->load(['market', 'signal', 'history']);
 
         $holdingMinutes = $paperTrade->entered_at
-            ? now()->diffInMinutes($paperTrade->entered_at)
+            ? (int) $paperTrade->entered_at->diffInMinutes(now())
             : 0;
 
         $holdingDisplay = $holdingMinutes < 60
