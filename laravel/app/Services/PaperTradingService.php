@@ -168,7 +168,7 @@ final class PaperTradingService
                 $trade->update([
                     'status'               => PaperTrade::STATUS_CLOSED,
                     'exit_price'           => $exitPrice,
-                    'holding_period_hours' => now()->diffInSeconds($trade->entered_at) / 3600.0,
+                    'holding_period_hours' => $trade->entered_at->diffInSeconds(now()) / 3600.0,
                     'exited_at'            => now(),
                     'outcome'              => $outcome ?? ($trade->pnl_usd >= 0 ? 'win' : 'loss'),
                 ]);
@@ -192,7 +192,7 @@ final class PaperTradingService
                 : 0.0;
             $roi = max(-1.0, $rawRoi);
 
-            $holdingPeriodHours = now()->diffInSeconds($trade->entered_at) / 3600.0;
+            $holdingPeriodHours = $trade->entered_at->diffInSeconds(now()) / 3600.0;
 
             if (! $outcome) {
                 if ($totalPnlUsd > 0)       $outcome = 'win';
