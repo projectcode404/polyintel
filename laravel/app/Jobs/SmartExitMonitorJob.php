@@ -224,7 +224,12 @@ final class SmartExitMonitorJob implements ShouldQueue
                 'reason'          => $reason,
             ]);
 
-            $totalPnl = $this->getTotalRealizedPnl($trade) + $pnl;
+            // BUG FIX: getTotalRealizedPnl() queries paper_trade_history AFTER
+            // the create() above, so it already includes this exit's $pnl.
+            // Previously this added $pnl a second time, double-counting the
+            // final exit's PnL (observed: SMART_EXIT pnl_realized=4.89 counted
+            // twice, inflating total from $6.41 to $11.30, ROI from ~128% to 226%).
+            $totalPnl = $this->getTotalRealizedPnl($trade);
 
             // BUG #4 INVARIANT: ROI tidak boleh di bawah -100%
             $rawRoi = (float) $trade->position_size_usd > 0
@@ -347,7 +352,12 @@ final class SmartExitMonitorJob implements ShouldQueue
                 ? PaperTrade::STATUS_CLOSED
                 : PaperTrade::STATUS_PARTIAL;
 
-            $totalPnl = $this->getTotalRealizedPnl($trade) + $pnl;
+            // BUG FIX: getTotalRealizedPnl() queries paper_trade_history AFTER
+            // the TP1/TP2/SMART_EXIT create() above (which already wrote this
+            // leg's $pnl), so it already includes this leg's PnL. Previously
+            // this added $pnl a second time, double-counting every partial
+            // exit leg (TP1, TP2, partial SMART_EXIT) — not just the final exit.
+            $totalPnl = $this->getTotalRealizedPnl($trade);
 
             // BUG #4 INVARIANT: ROI tidak boleh di bawah -100%
             $rawRoi = (float) $trade->position_size_usd > 0
