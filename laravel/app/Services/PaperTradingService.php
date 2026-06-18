@@ -120,7 +120,7 @@ final class PaperTradingService
                 'shares'                      => $shares,
                 'position_size_usd'           => $positionSizeUsd,
                 'fees_usd'                    => $feesUsd,
-                'market_probability_at_entry' => $signal->market_probability_at_signal,
+                'market_probability_at_entry' => (float) $signal->market->market_probability, // FIX: use real-time market probability, not stale signal value
                 'ai_probability_at_entry'     => $signal->ai_probability_at_signal,
                 'edge_at_entry'               => $signal->edge_at_signal,
                 'status'                      => PaperTrade::STATUS_OPEN,

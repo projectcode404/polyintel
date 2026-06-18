@@ -52,7 +52,7 @@ final class SignalRankerService
      * $12.86-liquidity market generated +1688% ROI from a stale
      * 0.008 -> 0.4275 -> 0.005 price oscillation).
      */
-    private const MIN_LIQUIDITY_USD = 1000.0;
+    private const MIN_LIQUIDITY_USD = 5000.0; // raised from 1000: data shows liquidity 1k-5k has median ROI = -100 (n=55)
 
     // -------------------------------------------------------------------------
     // Normalization Tiers
@@ -148,8 +148,9 @@ final class SignalRankerService
                + (self::WEIGHT_LIQUIDITY  * $liquidityScore)
                + (self::WEIGHT_VOLUME     * $volumeScore);
 
-        // Apply spread penalty
-        $score = $this->applySpreadPenalty($score, isset($signal['spread']) ? (float) $signal['spread'] : null);
+        // Spread penalty removed: Polymarket binary markets are structurally wide-spread (p50=0.98).
+        // Spread is not a discriminating signal here — all markets show spread > 0.90.
+        // Liquidity (MIN_LIQUIDITY_USD hard filter) is the correct quality gate.
 
         return round($this->clamp($score), 4);
     }

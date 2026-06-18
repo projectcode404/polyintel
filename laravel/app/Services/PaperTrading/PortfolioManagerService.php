@@ -214,7 +214,7 @@ final class PortfolioManagerService
                     'roi'                          => 0,
                     'current_price'                => $entryPrice,
                     'unrealized_pnl_usd'           => 0,
-                    'market_probability_at_entry'  => $signal['market_probability_at_signal'] ?? $signal['market_probability'] ?? 0,
+                    'market_probability_at_entry'  => $entryPrice, // FIX: use real-time entry price, not stale signal probability
                     'ai_probability_at_entry'      => $signal['ai_probability_at_signal']     ?? $signal['ai_probability']     ?? null,
                     'edge_at_entry'                => $signal['edge_at_signal']               ?? $signal['edge']               ?? 0,
                     'signal_score'                 => $signal['score']                        ?? null,
